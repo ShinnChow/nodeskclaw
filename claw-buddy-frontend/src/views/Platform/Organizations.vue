@@ -18,7 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Building2, Plus, Trash2, Pencil, Users } from 'lucide-vue-next'
+import { Building2, Plus, Trash2, Pencil, Users, Database } from 'lucide-vue-next'
 import { useOrgStore, type OrgInfo } from '@/stores/org'
 import { useNotify } from '@/components/ui/notify'
 import { useRouter } from 'vue-router'
@@ -32,7 +32,7 @@ const showEdit = ref(false)
 const editingOrg = ref<OrgInfo | null>(null)
 
 const createForm = ref({ name: '', slug: '', plan: 'free' })
-const editForm = ref({ name: '', plan: '', max_instances: 0, cluster_id: '' })
+const editForm = ref({ name: '', plan: '', max_instances: 0, max_storage_total: '', cluster_id: '' })
 
 onMounted(() => {
   orgStore.fetchAllOrgs()
@@ -55,6 +55,7 @@ function openEdit(org: OrgInfo) {
     name: org.name,
     plan: org.plan,
     max_instances: org.max_instances,
+    max_storage_total: org.max_storage_total || '500Gi',
     cluster_id: org.cluster_id || '',
   }
   showEdit.value = true
@@ -68,6 +69,8 @@ async function handleUpdate() {
     if (editForm.value.plan !== editingOrg.value.plan) data.plan = editForm.value.plan
     if (editForm.value.max_instances !== editingOrg.value.max_instances)
       data.max_instances = editForm.value.max_instances
+    if (editForm.value.max_storage_total !== (editingOrg.value.max_storage_total || '500Gi'))
+      data.max_storage_total = editForm.value.max_storage_total
     if (editForm.value.cluster_id !== (editingOrg.value.cluster_id || ''))
       data.cluster_id = editForm.value.cluster_id || null
 
@@ -131,10 +134,14 @@ const planLabels: Record<string, string> = {
               {{ planLabels[org.plan] || org.plan }}
             </Badge>
           </div>
-          <p class="text-xs text-muted-foreground font-mono">{{ org.slug }}</p>
+          <p class="text-xs text-muted-foreground"><span class="opacity-60">标识符:</span> <span class="font-mono">{{ org.slug }}</span></p>
         </CardHeader>
         <CardContent class="space-y-3">
           <div class="grid grid-cols-2 gap-2 text-xs">
+            <div>
+              <span class="text-muted-foreground">成员</span>
+              <span class="ml-1 font-medium">{{ org.member_count ?? 0 }} 人</span>
+            </div>
             <div>
               <span class="text-muted-foreground">实例上限</span>
               <span class="ml-1 font-medium">{{ org.max_instances }}</span>
@@ -147,9 +154,9 @@ const planLabels: Record<string, string> = {
               <span class="text-muted-foreground">内存上限</span>
               <span class="ml-1 font-medium">{{ org.max_mem_total }}</span>
             </div>
-            <div>
-              <span class="text-muted-foreground">专属集群</span>
-              <span class="ml-1 font-medium">{{ org.cluster_id ? '是' : '共享' }}</span>
+            <div class="col-span-2">
+              <span class="text-muted-foreground">存储上限</span>
+              <span class="ml-1 font-medium">{{ org.max_storage_total }}</span>
             </div>
           </div>
           <div class="flex items-center gap-2 pt-2 border-t border-border">
@@ -167,7 +174,6 @@ const planLabels: Record<string, string> = {
               成员
             </Button>
             <Button
-              v-if="org.slug !== 'default'"
               variant="ghost"
               size="sm"
               class="h-7 text-xs text-red-400 hover:text-red-300"
@@ -193,8 +199,8 @@ const planLabels: Record<string, string> = {
             <Input v-model="createForm.name" placeholder="e.g. 我的团队" />
           </div>
           <div class="space-y-2">
-            <label class="text-sm font-medium">Slug（URL 标识，小写字母/数字/短横线）</label>
-            <Input v-model="createForm.slug" placeholder="e.g. my-team" />
+            <label class="text-sm font-medium">标识符（小写字母/数字/短横线，创建后不可更改）</label>
+            <Input v-model="createForm.slug" placeholder="如 my-team" />
           </div>
           <div class="space-y-2">
             <label class="text-sm font-medium">套餐</label>
@@ -240,6 +246,10 @@ const planLabels: Record<string, string> = {
           <div class="space-y-2">
             <label class="text-sm font-medium">实例上限</label>
             <Input v-model.number="editForm.max_instances" type="number" />
+          </div>
+          <div class="space-y-2">
+            <label class="text-sm font-medium">存储上限</label>
+            <Input v-model="editForm.max_storage_total" placeholder="如 500Gi" />
           </div>
         </div>
         <DialogFooter>

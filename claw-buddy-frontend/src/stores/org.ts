@@ -11,8 +11,10 @@ export interface OrgInfo {
   max_instances: number
   max_cpu_total: string
   max_mem_total: string
+  max_storage_total: string
   cluster_id: string | null
   is_active: boolean
+  member_count: number
   created_at: string
   updated_at: string
 }
@@ -24,6 +26,7 @@ export interface MemberInfo {
   role: string
   user_name: string | null
   user_email: string | null
+  user_avatar_url: string | null
   created_at: string
 }
 
@@ -47,6 +50,8 @@ export interface OrgUsage {
   cpu_limit: string
   mem_used: string
   mem_limit: string
+  storage_used: string
+  storage_limit: string
 }
 
 export const useOrgStore = defineStore('org', () => {
@@ -60,15 +65,20 @@ export const useOrgStore = defineStore('org', () => {
   const currentOrgId = computed(() => currentOrg.value?.id ?? null)
 
   async function fetchMyOrgs() {
-    const res = await api.get('/orgs/my')
-    orgs.value = res.data.data ?? []
+    try {
+      const res = await api.get('/orgs/my')
+      orgs.value = res.data.data ?? []
 
-    // 同步当前组织
-    const authStore = useAuthStore()
-    if (authStore.user?.current_org_id) {
-      currentOrg.value = orgs.value.find(o => o.id === authStore.user!.current_org_id) ?? null
-    } else if (orgs.value.length > 0) {
-      currentOrg.value = orgs.value[0]
+      // 同步当前组织
+      const authStore = useAuthStore()
+      if (authStore.user?.current_org_id) {
+        currentOrg.value = orgs.value.find(o => o.id === authStore.user!.current_org_id) ?? null
+      }
+      if (!currentOrg.value && orgs.value.length > 0) {
+        currentOrg.value = orgs.value[0]
+      }
+    } catch (e) {
+      console.warn('[orgStore] fetchMyOrgs 失败:', e)
     }
   }
 
