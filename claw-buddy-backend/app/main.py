@@ -334,6 +334,45 @@ async def lifespan(app: FastAPI):
                 pass
         logger.info("自动迁移：已回填 instances.proxy_token")
 
+        # ── 迁移 12: user_llm_configs 新增 selected_models 列 ──
+        col = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'user_llm_configs' AND column_name = 'selected_models'"
+        ))
+        if col.first() is None:
+            tbl_exists = await conn.execute(text(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'user_llm_configs'"
+            ))
+            if tbl_exists.first() is not None:
+                await conn.execute(text(
+                    "ALTER TABLE user_llm_configs ADD COLUMN selected_models JSONB"
+                ))
+                logger.info("自动迁移：已为 user_llm_configs 表添加 selected_models 列")
+
+        # ── 迁移 13: instances 新增 wp_api_key 列 + 回填 ──
+        col = await conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'instances' AND column_name = 'wp_api_key'"
+        ))
+        if col.first() is None:
+            await conn.execute(text(
+                "ALTER TABLE instances ADD COLUMN wp_api_key VARCHAR(96)"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_instances_wp_api_key "
+                "ON instances (wp_api_key) WHERE wp_api_key IS NOT NULL"
+            ))
+            import secrets as _secrets_mod
+            rows = await conn.execute(text(
+                "SELECT id FROM instances WHERE wp_api_key IS NULL AND deleted_at IS NULL"
+            ))
+            for row in rows:
+                await conn.execute(
+                    text("UPDATE instances SET wp_api_key = :key WHERE id = :id"),
+                    {"key": f"clawbuddy-wp-{_secrets_mod.token_hex(32)}", "id": row.id},
+                )
+            logger.info("自动迁移：已为 instances 表添加 wp_api_key 列并回填")
+
     # ── 迁移 5e: 种子数据（默认组织 + 套餐 + 数据归属） ──
     async with async_session_factory() as db:
         from app.models.org_membership import OrgMembership, OrgRole
@@ -582,9 +621,31 @@ async def lifespan(app: FastAPI):
     summary_job = SummaryJob(async_session_factory)
     summary_job.start()
 
+    # ── 恢复工作区 SSE 连接 ────────────────────────────
+    from app.services.sse_listener import sse_listener_manager
+
+    async with async_session_factory() as db:
+        from app.models.instance import Instance
+        ws_agents = await db.execute(
+            select(Instance).where(
+                Instance.workspace_id.isnot(None),
+                Instance.status == "running",
+                Instance.ingress_domain.isnot(None),
+                Instance.deleted_at.is_(None),
+            )
+        )
+        for inst in ws_agents.scalars().all():
+            await sse_listener_manager.connect(inst.id, inst.ingress_domain)
+    logger.info(
+        "已恢复 %d 个工作区 SSE 连接",
+        len(sse_listener_manager.connected_instances),
+    )
+
     yield
 
     # ── Shutdown ─────────────────────────────────────
+    await sse_listener_manager.disconnect_all()
+    logger.info("已关闭所有 SSE 连接")
     await summary_job.stop()
     await health_checker.stop()
     await k8s_manager.close_all()
@@ -614,8 +675,9 @@ register_exception_handlers(app)
 # ── Routers ──────────────────────────────────────────
 app.include_router(api_router, prefix="/api/v1")
 
-from app.api.llm_proxy import router as llm_proxy_router
-app.include_router(llm_proxy_router, tags=["LLM 代理"])
+if settings.DEBUG:
+    from app.api.llm_proxy import router as llm_proxy_router
+    app.include_router(llm_proxy_router, tags=["LLM 代理（开发模式）"])
 
 # ── Static files (前端 build 产物) ───────────────────
 # 生产环境：Vite build 后的 dist 目录会被复制到 static/

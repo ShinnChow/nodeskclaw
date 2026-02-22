@@ -21,9 +21,11 @@ from app.schemas.llm import (
     AvailableLlmKey,
     InstanceLlmConfigInfo,
     LlmConfigUpdateResult,
+    OpenClawConfigResponse,
     OrgLlmKeyCreate,
     OrgLlmKeyInfo,
     OrgLlmKeyUpdate,
+    ProviderModelsResponse,
     UserLlmConfigInfo,
     UserLlmConfigUpdate,
     UserLlmKeyCreate,
@@ -279,6 +281,62 @@ async def delete_user_llm_key(
 
 
 # ══════════════════════════════════════════════════════════
+# Provider Model Catalog
+# ══════════════════════════════════════════════════════════
+
+@router.get("/llm/providers/{provider}/models", response_model=ApiResponse[ProviderModelsResponse])
+async def list_provider_models(
+    provider: str,
+    api_key: str | None = Query(None),
+    org_id: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetch available models from a provider's API.
+
+    - If api_key is provided, use it directly (personal key scenario).
+    - Otherwise, look up an active org key for the given (org_id, provider).
+    """
+    resolved_key = api_key
+    if not resolved_key:
+        pk_result = await db.execute(
+            select(UserLlmKey).where(
+                UserLlmKey.user_id == current_user.id,
+                UserLlmKey.provider == provider,
+                not_deleted(UserLlmKey),
+            ).limit(1)
+        )
+        personal_key = pk_result.scalar_one_or_none()
+        if personal_key:
+            resolved_key = personal_key.api_key
+
+    if not resolved_key and org_id:
+        result = await db.execute(
+            select(OrgLlmKey).where(
+                OrgLlmKey.org_id == org_id,
+                OrgLlmKey.provider == provider,
+                OrgLlmKey.is_active.is_(True),
+                not_deleted(OrgLlmKey),
+            ).limit(1)
+        )
+        org_key = result.scalar_one_or_none()
+        if org_key:
+            resolved_key = org_key.api_key
+
+    if not resolved_key:
+        return ApiResponse(data=ProviderModelsResponse(provider=provider, models=[]),
+                           message=f"无可用的 {provider} Key，请先配置个人 Key 或 Working Plan")
+
+    from app.services.model_catalog_service import fetch_provider_models
+    try:
+        models = await fetch_provider_models(provider, resolved_key)
+    except ValueError as e:
+        return ApiResponse(data=ProviderModelsResponse(provider=provider, models=[]),
+                           message=str(e))
+    return ApiResponse(data=ProviderModelsResponse(provider=provider, models=models))
+
+
+# ══════════════════════════════════════════════════════════
 # User LLM Configs (Portal - key source selection)
 # ══════════════════════════════════════════════════════════
 
@@ -297,21 +355,11 @@ async def get_user_llm_configs(
     )
     configs = result.scalars().all()
 
-    org_key_ids = [c.org_llm_key_id for c in configs if c.org_llm_key_id]
-    label_map: dict[str, str] = {}
-    if org_key_ids:
-        keys_result = await db.execute(
-            select(OrgLlmKey.id, OrgLlmKey.label).where(OrgLlmKey.id.in_(org_key_ids))
-        )
-        for row in keys_result:
-            label_map[row[0]] = row[1]
-
     return ApiResponse(data=[
         UserLlmConfigInfo(
             provider=c.provider,
             key_source=c.key_source,
-            org_llm_key_id=c.org_llm_key_id,
-            org_llm_key_label=label_map.get(c.org_llm_key_id) if c.org_llm_key_id else None,
+            selected_models=c.selected_models,
         )
         for c in configs
     ])
@@ -340,14 +388,15 @@ async def update_user_llm_configs(
         existing = old_map.get(item.provider)
         if existing:
             existing.key_source = item.key_source
-            existing.org_llm_key_id = item.org_llm_key_id
+            existing.org_llm_key_id = None
+            existing.selected_models = item.selected_models
         else:
             db.add(UserLlmConfig(
                 user_id=current_user.id,
                 org_id=body.org_id,
                 provider=item.provider,
                 key_source=item.key_source,
-                org_llm_key_id=item.org_llm_key_id,
+                selected_models=item.selected_models,
             ))
 
     for provider in old_providers - new_providers:
@@ -397,6 +446,24 @@ async def restart_openclaw(
     return ApiResponse(data=result_data)
 
 
+@router.get("/instances/{instance_id}/openclaw-providers", response_model=ApiResponse[OpenClawConfigResponse])
+async def get_openclaw_providers(
+    instance_id: str,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Instance).where(Instance.id == instance_id, Instance.deleted_at.is_(None))
+    )
+    instance = result.scalar_one_or_none()
+    if instance is None:
+        raise NotFoundError("实例不存在")
+
+    from app.services.llm_config_service import read_openclaw_providers
+    config = await read_openclaw_providers(instance, db)
+    return ApiResponse(data=config)
+
+
 @router.get("/instances/{instance_id}/llm-config", response_model=ApiResponse[list[InstanceLlmConfigInfo]])
 async def get_instance_llm_config(
     instance_id: str,
@@ -419,33 +486,25 @@ async def get_instance_llm_config(
     )
     configs = configs_result.scalars().all()
 
+    user_keys_result = await db.execute(
+        select(UserLlmKey).where(
+            UserLlmKey.user_id == instance.created_by,
+            not_deleted(UserLlmKey),
+        )
+    )
+    user_keys = {k.provider: k for k in user_keys_result.scalars().all()}
+
     items: list[InstanceLlmConfigInfo] = []
     for c in configs:
-        label = None
         masked = None
-        if c.key_source == "org" and c.org_llm_key_id:
-            key_r = await db.execute(
-                select(OrgLlmKey).where(OrgLlmKey.id == c.org_llm_key_id)
-            )
-            org_key = key_r.scalar_one_or_none()
-            if org_key:
-                label = org_key.label
-                masked = _mask_key(org_key.api_key)
-        elif c.key_source == "personal":
-            key_r = await db.execute(
-                select(UserLlmKey).where(
-                    UserLlmKey.user_id == instance.created_by,
-                    UserLlmKey.provider == c.provider,
-                    not_deleted(UserLlmKey),
-                )
-            )
-            user_key = key_r.scalar_one_or_none()
-            if user_key:
-                masked = _mask_key(user_key.api_key)
+        if c.key_source == "personal":
+            uk = user_keys.get(c.provider)
+            if uk:
+                masked = _mask_key(uk.api_key)
 
         items.append(InstanceLlmConfigInfo(
             provider=c.provider, key_source=c.key_source,
-            key_label=label, api_key_masked=masked,
+            api_key_masked=masked,
         ))
 
     return ApiResponse(data=items)

@@ -1,35 +1,35 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, Loader2, Brain, Key, Save, Trash2, Plus, RefreshCw } from 'lucide-vue-next'
+import { ref, computed, watch, inject, type ComputedRef, type Ref } from 'vue'
+import { Loader2, Brain, Key, Trash2, Plus, RefreshCw, HardDrive, Save, ChevronDown, Check } from 'lucide-vue-next'
+import ModelSelect from '@/components/shared/ModelSelect.vue'
+import type { ModelItem } from '@/components/shared/ModelSelect.vue'
 import api from '@/services/api'
-import { useAuthStore } from '@/stores/auth'
 
-const route = useRoute()
-const router = useRouter()
-const authStore = useAuthStore()
+const instanceId = inject<ComputedRef<string>>('instanceId')!
+const instanceOrgId = inject<Ref<string | null>>('instanceOrgId')!
 
-const instanceId = computed(() => route.params.id as string)
-const instanceName = ref('')
 const loading = ref(true)
 const saving = ref(false)
 const restarting = ref(false)
 const error = ref('')
 const successMsg = ref('')
+const nfsError = ref('')
+const dataSource = ref('')
+const dirty = ref(false)
 
-interface AvailableKey {
-  id: string
-  provider: string
-  label: string
-  api_key_masked: string
-  is_active: boolean
+// ── Constants ──
+
+const PROVIDERS = ['openai', 'anthropic', 'gemini', 'openrouter', 'minimax-openai', 'minimax-anthropic'] as const
+const PROVIDER_LABELS: Record<string, string> = {
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  gemini: 'Google Gemini',
+  openrouter: 'OpenRouter',
+  'minimax-openai': 'MiniMax-OpenAI (CN)',
+  'minimax-anthropic': 'MiniMax-Anthropic (CN)',
 }
 
-interface LlmConfigEntry {
-  provider: string
-  keySource: 'org' | 'personal' | 'none'
-  orgKeyId: string
-}
+// ── Types ──
 
 interface PersonalKey {
   id: string
@@ -39,333 +39,461 @@ interface PersonalKey {
   is_active: boolean
 }
 
-const PROVIDERS = ['openai', 'anthropic', 'gemini', 'openrouter'] as const
-const PROVIDER_LABELS: Record<string, string> = {
-  openai: 'OpenAI',
-  anthropic: 'Anthropic',
-  gemini: 'Google Gemini',
-  openrouter: 'OpenRouter',
+interface ProviderConfig {
+  provider: string
+  keySource: 'org' | 'personal'
+  personalKeyNew: string
+  personalKeyMasked: string
+  hasExistingPersonalKey: boolean
+  selectedModel: ModelItem | null
 }
 
-const availableOrgKeys = ref<AvailableKey[]>([])
-const llmConfigs = ref<LlmConfigEntry[]>([])
+const BUILTIN_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'openrouter'])
+const WORKING_PLAN_PROVIDERS = new Set(['minimax-openai', 'minimax-anthropic'])
+
+// ── State ──
+
+const providerConfigs = ref<ProviderConfig[]>([])
 const personalKeys = ref<PersonalKey[]>([])
+const newProviderOpen = ref(false)
 
-const newKeyProvider = ref('')
-const newKeyValue = ref('')
-const newKeyBaseUrl = ref('')
-const addingKey = ref(false)
+const unusedProviders = computed(() =>
+  PROVIDERS.filter(p => !providerConfigs.value.some(c => c.provider === p))
+)
 
-function orgKeysForProvider(provider: string) {
-  return availableOrgKeys.value.filter(k => k.provider === provider)
+function personalKeyForProvider(provider: string) {
+  return personalKeys.value.find(k => k.provider === provider)
 }
 
-async function fetchAll() {
+// ── Data loading ──
+
+async function loadAll() {
   loading.value = true
-  const orgId = authStore.user?.current_org_id
-  if (!orgId) return
+  error.value = ''
+  nfsError.value = ''
+  successMsg.value = ''
+
+  const orgId = instanceOrgId.value
 
   try {
-    const [instanceRes, keysRes, configsRes, personalRes] = await Promise.all([
-      api.get(`/instances/${instanceId.value}/llm-config`),
-      api.get(`/orgs/${orgId}/available-llm-keys`),
-      api.get('/users/me/llm-configs', { params: { org_id: orgId } }),
+    const requests: Promise<any>[] = [
+      api.get(`/instances/${instanceId.value}/openclaw-providers`),
       api.get('/users/me/llm-keys'),
-    ])
-
-    availableOrgKeys.value = keysRes.data.data ?? []
-    personalKeys.value = personalRes.data.data ?? []
-
-    const existing: Record<string, any> = {}
-    for (const c of (configsRes.data.data ?? [])) {
-      existing[c.provider] = c
+    ]
+    if (orgId) {
+      requests.push(api.get(`/users/me/llm-configs?org_id=${orgId}`))
     }
 
-    llmConfigs.value = PROVIDERS.map(p => {
-      const cfg = existing[p]
-      return {
-        provider: p,
-        keySource: cfg?.key_source ?? 'none',
-        orgKeyId: cfg?.org_llm_key_id ?? '',
+    const results = await Promise.allSettled(requests)
+
+    // NFS providers
+    const nfsResult = results[0]
+    if (nfsResult.status === 'fulfilled') {
+      const data = nfsResult.value.data.data
+      dataSource.value = data.data_source ?? ''
+    } else {
+      const e = nfsResult.reason
+      const status = e?.response?.status
+      const msg = e?.response?.data?.message || ''
+      if (status === 503 && (msg.includes('NFS') || msg.includes('nfs') || msg.includes('mount') || msg.includes('挂载'))) {
+        nfsError.value = msg
       }
-    })
-
-    // Fetch instance name from the LLM config endpoint data or the route
-    const instanceDetail = instanceRes.data.data
-    if (Array.isArray(instanceDetail) && instanceDetail.length > 0) {
-      // configs come from instance, name from route or separate call
     }
-  } catch {
-    error.value = '加载配置失败'
+
+    // Personal keys
+    if (results[1].status === 'fulfilled') {
+      personalKeys.value = results[1].value.data.data ?? []
+    }
+
+    // User LLM configs (DB)
+    const dbConfigs: { provider: string; key_source: string }[] = []
+    if (results[2]?.status === 'fulfilled') {
+      dbConfigs.push(...(results[2].value.data.data ?? []))
+    }
+
+    // Build editable provider configs from DB configs
+    const configs: ProviderConfig[] = []
+    for (const c of dbConfigs) {
+      const pk = personalKeyForProvider(c.provider)
+      configs.push({
+        provider: c.provider,
+        keySource: (c.key_source === 'org' || c.key_source === 'personal') ? c.key_source : 'org',
+        personalKeyNew: '',
+        personalKeyMasked: pk?.api_key_masked ?? '',
+        hasExistingPersonalKey: !!pk,
+        selectedModel: ((c as any).selected_models ?? [])[0] ?? null,
+      })
+    }
+
+    // If DB has no configs but NFS has providers, populate from NFS
+    if (configs.length === 0 && nfsResult.status === 'fulfilled') {
+      const nfsProviders = nfsResult.value.data.data?.providers ?? []
+      for (const np of nfsProviders) {
+        const pk = personalKeyForProvider(np.provider)
+        configs.push({
+          provider: np.provider,
+          keySource: np.key_source === 'org' ? 'org' : 'personal',
+          personalKeyNew: '',
+          personalKeyMasked: pk?.api_key_masked ?? np.api_key_masked ?? '',
+          hasExistingPersonalKey: !!pk,
+          selectedModel: null,
+        })
+      }
+    }
+
+    providerConfigs.value = configs
+    dirty.value = false
+  } catch (e: any) {
+    error.value = e?.response?.data?.message || '加载配置失败'
   } finally {
     loading.value = false
   }
 }
 
-async function fetchInstanceName() {
+// ── Provider management ──
+
+function addProvider(provider: string) {
+  if (providerConfigs.value.some(c => c.provider === provider)) return
+  const pk = personalKeyForProvider(provider)
+  providerConfigs.value.push({
+    provider,
+    keySource: WORKING_PLAN_PROVIDERS.has(provider) ? 'org' : 'personal',
+    personalKeyNew: '',
+    personalKeyMasked: pk?.api_key_masked ?? '',
+    hasExistingPersonalKey: !!pk,
+    selectedModel: null,
+  })
+  newProviderOpen.value = false
+  dirty.value = true
+}
+
+async function handleFetchModels(provider: string, callback: (models: ModelItem[], error?: string) => void) {
+  const cfg = providerConfigs.value.find(c => c.provider === provider)
+  const params: Record<string, string> = {}
+  if (cfg?.keySource === 'personal' && cfg.personalKeyNew) {
+    params.api_key = cfg.personalKeyNew
+  }
+  if (instanceOrgId.value) {
+    params.org_id = instanceOrgId.value
+  }
   try {
-    const res = await api.get(`/instances/${instanceId.value}`)
-    instanceName.value = res.data.data?.name ?? ''
-  } catch {
-    // ignore
+    const res = await api.get(`/llm/providers/${provider}/models`, { params })
+    const msg = res.data?.message ?? ''
+    callback(res.data.data?.models ?? [], msg || undefined)
+  } catch (e: any) {
+    callback([], e?.response?.data?.message ?? '拉取模型列表失败')
   }
 }
 
-async function saveConfigs() {
-  const orgId = authStore.user?.current_org_id
-  if (!orgId) return
+function removeProvider(idx: number) {
+  providerConfigs.value.splice(idx, 1)
+  dirty.value = true
+}
+
+function markDirty() {
+  dirty.value = true
+}
+
+// ── Validation ──
+
+function validateConfigs(): string | null {
+  for (const cfg of providerConfigs.value) {
+    const label = PROVIDER_LABELS[cfg.provider] || cfg.provider
+    if (cfg.keySource === 'personal') {
+      if (!cfg.personalKeyNew && !cfg.hasExistingPersonalKey) {
+        return `${label}: 请输入个人 API Key`
+      }
+    }
+    if (!cfg.selectedModel) {
+      return `${label}: 请选择一个模型`
+    }
+  }
+  return null
+}
+
+const canSave = computed(() => {
+  if (!dirty.value || providerConfigs.value.length === 0) return false
+  return providerConfigs.value.every(c => !!c.selectedModel)
+})
+
+// ── Save ──
+
+async function handleSave() {
+  const validationError = validateConfigs()
+  if (validationError) {
+    error.value = validationError
+    return
+  }
+
+  const orgId = instanceOrgId.value
+  if (!orgId) {
+    error.value = '实例未关联组织，无法保存配置'
+    return
+  }
 
   saving.value = true
   error.value = ''
   successMsg.value = ''
 
   try {
-    const configs = llmConfigs.value
-      .filter(c => c.keySource !== 'none')
-      .map(c => ({
+    // 1. Upsert personal keys
+    for (const cfg of providerConfigs.value) {
+      if (cfg.keySource === 'personal' && cfg.personalKeyNew) {
+        await api.post('/users/me/llm-keys', {
+          provider: cfg.provider,
+          api_key: cfg.personalKeyNew,
+        })
+        cfg.personalKeyMasked = cfg.personalKeyNew.length > 8
+          ? cfg.personalKeyNew.slice(0, 6) + '***' + cfg.personalKeyNew.slice(-3)
+          : cfg.personalKeyNew.slice(0, 2) + '***'
+        cfg.personalKeyNew = ''
+        cfg.hasExistingPersonalKey = true
+      }
+    }
+
+    // 2. Save LLM configs
+    await api.put('/users/me/llm-configs', {
+      org_id: orgId,
+      configs: providerConfigs.value.map(c => ({
         provider: c.provider,
         key_source: c.keySource,
-        org_llm_key_id: c.keySource === 'org' ? c.orgKeyId || undefined : undefined,
-      }))
-
-    const res = await api.put('/users/me/llm-configs', {
-      org_id: orgId,
-      configs,
+        selected_models: c.selectedModel ? [c.selectedModel] : undefined,
+      })),
     })
 
+    // 3. Restart OpenClaw (needs longer timeout: waits for pod ready)
+    restarting.value = true
+    const res = await api.post(`/instances/${instanceId.value}/restart-openclaw`, null, { timeout: 120000 })
     const result = res.data.data
-    if (result?.needs_restart && result.affected_instances?.length > 0) {
-      const names = result.affected_instances.map((i: any) => i.name).join(', ')
-      if (confirm(`配置已保存。以下实例需要重启 OpenClaw 以加载新 Provider，OpenClaw 会在完成当前任务后重启：\n\n${names}\n\n确认重启？`)) {
-        await restartOpenClaw()
-      } else {
-        successMsg.value = '配置已保存（未重启）'
-      }
+    if (result?.status === 'ok') {
+      successMsg.value = '配置已保存，OpenClaw 已重启'
+    } else if (result?.status === 'timeout') {
+      successMsg.value = '配置已保存，但 OpenClaw 重启超时，请检查实例状态'
     } else {
       successMsg.value = '配置已保存'
+      if (result?.message) {
+        error.value = result.message
+      }
     }
+
+    dirty.value = false
+    // Refresh personal keys list
+    const pkRes = await api.get('/users/me/llm-keys')
+    personalKeys.value = pkRes.data.data ?? []
   } catch (e: any) {
     error.value = e?.response?.data?.message || '保存失败'
   } finally {
     saving.value = false
-  }
-}
-
-async function restartOpenClaw() {
-  restarting.value = true
-  try {
-    const res = await api.post(`/instances/${instanceId.value}/restart-openclaw`)
-    const result = res.data.data
-    if (result?.status === 'ok') {
-      successMsg.value = 'OpenClaw 已重启完成'
-    } else if (result?.status === 'timeout') {
-      error.value = result.message || '重启超时'
-    } else {
-      error.value = result?.message || '重启失败'
-    }
-  } catch (e: any) {
-    error.value = e?.response?.data?.message || '重启请求失败'
-  } finally {
     restarting.value = false
   }
 }
 
-async function addPersonalKey() {
-  if (!newKeyProvider.value || !newKeyValue.value) return
-  addingKey.value = true
-  try {
-    await api.post('/users/me/llm-keys', {
-      provider: newKeyProvider.value,
-      api_key: newKeyValue.value,
-      base_url: newKeyBaseUrl.value || undefined,
-    })
-    newKeyProvider.value = ''
-    newKeyValue.value = ''
-    newKeyBaseUrl.value = ''
-    const res = await api.get('/users/me/llm-keys')
-    personalKeys.value = res.data.data ?? []
-  } catch (e: any) {
-    error.value = e?.response?.data?.message || '添加失败'
-  } finally {
-    addingKey.value = false
-  }
-}
-
-async function deletePersonalKey(provider: string) {
-  if (!confirm(`确认删除 ${PROVIDER_LABELS[provider] || provider} 的个人 Key？`)) return
-  try {
-    await api.delete(`/users/me/llm-keys/${provider}`)
-    personalKeys.value = personalKeys.value.filter(k => k.provider !== provider)
-  } catch (e: any) {
-    error.value = e?.response?.data?.message || '删除失败'
-  }
-}
-
-onMounted(() => {
-  fetchInstanceName()
-  fetchAll()
-})
+watch(instanceOrgId, (val) => {
+  if (val) loadAll()
+}, { immediate: true })
 </script>
 
 <template>
-  <div class="max-w-2xl mx-auto px-6 py-8">
-    <div class="flex items-center gap-3 mb-8">
-      <button class="p-1.5 rounded-lg hover:bg-muted transition-colors" @click="router.push(`/instances/${instanceId}`)">
-        <ArrowLeft class="w-5 h-5" />
-      </button>
-      <div>
-        <h1 class="text-xl font-bold">{{ instanceName || '实例' }} 设置</h1>
-        <p class="text-sm text-muted-foreground mt-1">管理大模型配置和 API Key</p>
-      </div>
-    </div>
-
+  <div>
     <div v-if="loading" class="flex items-center justify-center py-20">
       <Loader2 class="w-6 h-6 animate-spin text-muted-foreground" />
     </div>
 
-    <div v-else class="space-y-8">
-      <!-- 重启中提示 -->
-      <div v-if="restarting" class="flex items-center gap-3 p-4 rounded-lg bg-amber-500/10 border border-amber-500/20">
-        <RefreshCw class="w-5 h-5 text-amber-500 animate-spin" />
-        <span class="text-sm">OpenClaw 正在完成当前任务并重启...</span>
-      </div>
-
-      <!-- 消息提示 -->
-      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
-      <p v-if="successMsg" class="text-sm text-green-500">{{ successMsg }}</p>
-
-      <!-- 大模型配置 -->
-      <div class="space-y-4">
+    <div v-else class="space-y-6">
+      <!-- Header -->
+      <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
           <Brain class="w-4 h-4 text-violet-400" />
           <h2 class="text-sm font-medium">大模型配置</h2>
+          <span v-if="dataSource === 'nfs' && !nfsError" class="text-[10px] text-muted-foreground bg-muted/50 px-1.5 py-0.5 rounded">
+            NFS
+          </span>
         </div>
-        <p class="text-xs text-muted-foreground">
-          Key 选择为用户级别设置，更改会影响你在该组织下的所有实例
-        </p>
+        <div class="flex items-center gap-2">
+          <button
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs hover:bg-card transition-colors"
+            :disabled="saving || restarting"
+            @click="loadAll"
+          >
+            <RefreshCw class="w-3 h-3" />
+            刷新
+          </button>
+          <button
+            v-if="providerConfigs.length > 0"
+            :disabled="saving || restarting || !canSave"
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs transition-colors"
+            :class="canSave
+              ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+              : 'bg-muted text-muted-foreground'"
+            @click="handleSave"
+          >
+            <Loader2 v-if="saving || restarting" class="w-3 h-3 animate-spin" />
+            <Save v-else class="w-3 h-3" />
+            {{ restarting ? '重启中...' : saving ? '保存中...' : '保存并重启' }}
+          </button>
+        </div>
+      </div>
 
-        <div class="space-y-3">
+      <!-- Status messages -->
+      <div v-if="restarting" class="flex items-center gap-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
+        <RefreshCw class="w-4 h-4 text-amber-500 animate-spin" />
+        <span class="text-xs">OpenClaw 正在完成当前任务并重启...</span>
+      </div>
+      <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+      <p v-if="successMsg" class="text-sm text-green-500">{{ successMsg }}</p>
+
+      <!-- NFS error -->
+      <div v-if="nfsError" class="flex flex-col items-center gap-3 py-10 text-center">
+        <HardDrive class="w-8 h-8 text-destructive/60" />
+        <p class="text-sm text-destructive">NFS 存储不可用</p>
+        <p class="text-xs text-muted-foreground max-w-sm">{{ nfsError }}</p>
+      </div>
+
+      <!-- Provider list -->
+      <template v-if="!nfsError">
+        <!-- Empty state: provider grid -->
+        <div v-if="providerConfigs.length === 0 && !saving" class="space-y-3">
+          <p class="text-xs text-muted-foreground">
+            当前实例未配置大模型 Provider，选择一个开始配置
+          </p>
+          <div class="grid grid-cols-2 gap-2">
+            <button
+              v-for="p in unusedProviders"
+              :key="p"
+              class="px-4 py-3 rounded-lg border border-border bg-card text-sm text-left hover:border-primary/50 hover:bg-primary/5 transition-colors cursor-pointer"
+              @click="addProvider(p)"
+            >
+              {{ PROVIDER_LABELS[p] || p }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Provider cards -->
+        <div v-else class="space-y-3">
           <div
-            v-for="cfg in llmConfigs"
+            v-for="(cfg, idx) in providerConfigs"
             :key="cfg.provider"
             class="rounded-lg border border-border bg-card p-4 space-y-3"
           >
-            <div class="font-medium text-sm">{{ PROVIDER_LABELS[cfg.provider] || cfg.provider }}</div>
-
-            <div class="space-y-2">
-              <label class="flex items-center gap-2 text-sm cursor-pointer">
-                <input type="radio" :name="`llm-${cfg.provider}`" value="none" v-model="cfg.keySource" class="accent-primary" />
-                <span class="text-muted-foreground">不使用</span>
-              </label>
-
-              <label v-if="orgKeysForProvider(cfg.provider).length > 0" class="flex items-center gap-2 text-sm cursor-pointer">
-                <input type="radio" :name="`llm-${cfg.provider}`" value="org" v-model="cfg.keySource" class="accent-primary" />
-                <span>使用组织 Key</span>
-              </label>
-              <select
-                v-if="cfg.keySource === 'org' && orgKeysForProvider(cfg.provider).length > 0"
-                v-model="cfg.orgKeyId"
-                class="ml-6 w-[calc(100%-1.5rem)] px-3 py-1.5 rounded-md bg-background border border-border text-sm focus:outline-none focus:ring-1 focus:ring-primary/50"
+            <!-- Provider header -->
+            <div class="flex items-center justify-between">
+              <span class="font-medium text-sm">{{ PROVIDER_LABELS[cfg.provider] || cfg.provider }}</span>
+              <button
+                class="text-muted-foreground hover:text-destructive transition-colors"
+                @click="removeProvider(idx)"
               >
-                <option value="" disabled>选择 Key</option>
-                <option v-for="k in orgKeysForProvider(cfg.provider)" :key="k.id" :value="k.id">
-                  {{ k.label }} ({{ k.api_key_masked }})
-                </option>
-              </select>
+                <Trash2 class="w-4 h-4" />
+              </button>
+            </div>
 
-              <label class="flex items-center gap-2 text-sm cursor-pointer">
-                <input type="radio" :name="`llm-${cfg.provider}`" value="personal" v-model="cfg.keySource" class="accent-primary" />
-                <span>使用个人 Key</span>
-                <span v-if="personalKeys.find(k => k.provider === cfg.provider)" class="text-xs text-muted-foreground">
-                  ({{ personalKeys.find(k => k.provider === cfg.provider)?.api_key_masked }})
+            <!-- Key source selection -->
+            <div class="space-y-2">
+              <div class="flex gap-4 text-sm">
+                <span class="relative group">
+                  <label
+                    class="flex items-center gap-1.5"
+                    :class="WORKING_PLAN_PROVIDERS.has(cfg.provider) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'"
+                  >
+                    <input
+                      type="radio"
+                      :name="`ks-${cfg.provider}`"
+                      value="org"
+                      v-model="cfg.keySource"
+                      class="accent-primary"
+                      :disabled="!WORKING_PLAN_PROVIDERS.has(cfg.provider)"
+                      @change="markDirty"
+                    />
+                    Working Plan
+                  </label>
+                  <span
+                    v-if="!WORKING_PLAN_PROVIDERS.has(cfg.provider)"
+                    class="pointer-events-none absolute z-50 top-full left-1/2 -translate-x-1/2 mt-1.5 whitespace-nowrap rounded bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md border border-border invisible group-hover:visible"
+                  >
+                    该 Provider 暂未开放 Working Plan
+                  </span>
                 </span>
-              </label>
+                <label class="flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="radio"
+                    :name="`ks-${cfg.provider}`"
+                    value="personal"
+                    v-model="cfg.keySource"
+                    class="accent-primary"
+                    @change="markDirty"
+                  />
+                  个人 Key
+                </label>
+              </div>
+
+              <!-- Working Plan hint -->
+              <p v-if="cfg.keySource === 'org'" class="text-xs text-muted-foreground pl-0.5">
+                使用组织统一配置的 Key，无需自行输入
+              </p>
+
+              <!-- Personal key -->
+              <div v-if="cfg.keySource === 'personal'" class="space-y-1.5">
+                <div v-if="cfg.hasExistingPersonalKey" class="flex items-center gap-2 text-xs">
+                  <Check class="w-3 h-3 text-green-400" />
+                  <span class="text-muted-foreground">当前 Key:</span>
+                  <span class="font-mono">{{ cfg.personalKeyMasked }}</span>
+                </div>
+                <div class="relative">
+                  <Key class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                  <input
+                    v-model="cfg.personalKeyNew"
+                    type="password"
+                    :placeholder="cfg.hasExistingPersonalKey ? '输入新 Key 以替换' : '输入 API Key'"
+                    class="w-full pl-9 pr-3 py-1.5 rounded-md bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
+                    @input="markDirty"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <!-- Model selection -->
+            <ModelSelect
+              :provider="cfg.provider"
+              v-model="cfg.selectedModel"
+              @fetch-models="handleFetchModels"
+              @update:model-value="markDirty"
+            />
+            <p v-if="!BUILTIN_PROVIDERS.has(cfg.provider) && !cfg.selectedModel" class="text-[10px] text-amber-500">
+              自定义 Provider 需要选择一个模型
+            </p>
+          </div>
+
+          <!-- Add provider -->
+          <div v-if="unusedProviders.length > 0" class="relative">
+            <button
+              class="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              @click="newProviderOpen = !newProviderOpen"
+            >
+              <Plus class="w-3.5 h-3.5" />
+              添加 Provider
+              <ChevronDown class="w-3 h-3 transition-transform" :class="newProviderOpen ? 'rotate-180' : ''" />
+            </button>
+            <div
+              v-if="newProviderOpen"
+              class="absolute z-10 mt-1 w-56 rounded-lg border border-border bg-card shadow-lg overflow-hidden"
+            >
+              <button
+                v-for="p in unusedProviders"
+                :key="p"
+                class="w-full px-4 py-2 text-left text-sm hover:bg-accent transition-colors"
+                @click="addProvider(p)"
+              >
+                {{ PROVIDER_LABELS[p] || p }}
+              </button>
             </div>
           </div>
         </div>
 
-        <button
-          :disabled="saving"
-          class="w-full py-2.5 px-4 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
-          @click="saveConfigs"
-        >
-          <Loader2 v-if="saving" class="w-4 h-4 animate-spin" />
-          <Save v-else class="w-4 h-4" />
-          {{ saving ? '保存中...' : '保存配置' }}
-        </button>
-      </div>
-
-      <!-- 个人 Key 管理 -->
-      <div class="space-y-4">
-        <div class="flex items-center gap-2">
-          <Key class="w-4 h-4 text-amber-400" />
-          <h2 class="text-sm font-medium">个人 Key 管理</h2>
-        </div>
-
-        <div v-if="personalKeys.length > 0" class="rounded-lg border border-border overflow-hidden">
-          <table class="w-full text-sm">
-            <thead class="bg-muted/50">
-              <tr>
-                <th class="text-left px-4 py-2 font-medium">Provider</th>
-                <th class="text-left px-4 py-2 font-medium">Key</th>
-                <th class="text-left px-4 py-2 font-medium">Base URL</th>
-                <th class="px-4 py-2 w-16"></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="k in personalKeys" :key="k.id" class="border-t border-border">
-                <td class="px-4 py-2">{{ PROVIDER_LABELS[k.provider] || k.provider }}</td>
-                <td class="px-4 py-2 font-mono text-xs">{{ k.api_key_masked }}</td>
-                <td class="px-4 py-2 text-xs text-muted-foreground">{{ k.base_url || '(默认)' }}</td>
-                <td class="px-4 py-2">
-                  <button class="p-1 rounded hover:bg-destructive/10 text-destructive transition-colors" @click="deletePersonalKey(k.provider)">
-                    <Trash2 class="w-3.5 h-3.5" />
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p v-else class="text-xs text-muted-foreground">暂无个人 Key</p>
-
-        <!-- 添加个人 Key -->
-        <div class="rounded-lg border border-border bg-card p-4 space-y-3">
-          <div class="text-sm font-medium flex items-center gap-1.5">
-            <Plus class="w-3.5 h-3.5" />
-            添加个人 Key
-          </div>
-          <div class="grid grid-cols-2 gap-3">
-            <select
-              v-model="newKeyProvider"
-              class="px-3 py-1.5 rounded-md bg-background border border-border text-sm focus:outline-none focus:ring-1 focus:ring-primary/50"
-            >
-              <option value="" disabled>选择 Provider</option>
-              <option v-for="p in PROVIDERS" :key="p" :value="p">{{ PROVIDER_LABELS[p] || p }}</option>
-            </select>
-            <input
-              v-model="newKeyBaseUrl"
-              type="text"
-              placeholder="Base URL (可选)"
-              class="px-3 py-1.5 rounded-md bg-background border border-border text-sm focus:outline-none focus:ring-1 focus:ring-primary/50"
-            />
-          </div>
-          <input
-            v-model="newKeyValue"
-            type="password"
-            placeholder="API Key"
-            class="w-full px-3 py-1.5 rounded-md bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
-          />
-          <button
-            :disabled="!newKeyProvider || !newKeyValue || addingKey"
-            class="px-4 py-1.5 rounded-md bg-primary text-primary-foreground text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center gap-1.5"
-            @click="addPersonalKey"
-          >
-            <Loader2 v-if="addingKey" class="w-3.5 h-3.5 animate-spin" />
-            <Plus v-else class="w-3.5 h-3.5" />
-            {{ addingKey ? '添加中...' : '添加' }}
-          </button>
-        </div>
-      </div>
+      </template>
     </div>
+
+    <!-- Close dropdown overlay -->
+    <Teleport to="body">
+      <div v-if="newProviderOpen" class="fixed inset-0 z-5" @click="newProviderOpen = false" />
+    </Teleport>
   </div>
 </template>

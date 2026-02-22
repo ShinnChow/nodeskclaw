@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ArrowLeft, Loader2, Rocket, Database, ChevronDown, RefreshCw, AlertCircle, Check, Brain, Key } from 'lucide-vue-next'
+import { ArrowLeft, ArrowRight, Loader2, Rocket, Database, ChevronDown, RefreshCw, AlertCircle, Check, Brain, Key, Trash2 } from 'lucide-vue-next'
+import ModelSelect from '@/components/shared/ModelSelect.vue'
+import type { ModelItem } from '@/components/shared/ModelSelect.vue'
 import { pinyin } from 'pinyin-pro'
 import api from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
@@ -21,50 +23,76 @@ const selectedImage = ref('')
 const storageGi = ref(20)
 const deploying = ref(false)
 const error = ref('')
+const currentStep = ref(1)
+
+const nameHasEdgeSpaces = computed(() => name.value.length > 0 && name.value !== name.value.trim())
+
+const canGoNext = computed(() =>
+  !!name.value.trim() && !nameHasEdgeSpaces.value
+  && !!slug.value && slugValid.value && !slugConflict.value && !slugChecking.value
+  && !!selectedImage.value && clusters.value.length > 0
+)
 
 // ── LLM config ──
-interface AvailableKey {
-  id: string
-  provider: string
-  label: string
-  api_key_masked: string
-  is_active: boolean
-}
-
 interface LlmConfigEntry {
   provider: string
-  keySource: 'org' | 'personal' | 'none'
-  orgKeyId: string
+  keySource: 'org' | 'personal'
   personalKey: string
+  selectedModel: ModelItem | null
 }
 
-const PROVIDERS = ['openai', 'anthropic', 'gemini', 'openrouter'] as const
+const PROVIDERS = ['openai', 'anthropic', 'gemini', 'openrouter', 'minimax-openai', 'minimax-anthropic'] as const
 const PROVIDER_LABELS: Record<string, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   gemini: 'Google Gemini',
   openrouter: 'OpenRouter',
+  'minimax-openai': 'MiniMax-OpenAI (CN)',
+  'minimax-anthropic': 'MiniMax-Anthropic (CN)',
 }
 
-const availableOrgKeys = ref<AvailableKey[]>([])
-const llmConfigs = ref<LlmConfigEntry[]>(
-  PROVIDERS.map(p => ({ provider: p, keySource: 'none' as const, orgKeyId: '', personalKey: '' }))
+const llmConfigs = ref<LlmConfigEntry[]>([])
+const llmSkipped = ref(false)
+const newProvider = ref('')
+
+const unusedProviders = computed(() =>
+  PROVIDERS.filter(p => !llmConfigs.value.some(c => c.provider === p))
 )
-const llmExpanded = ref(true)
 
-function orgKeysForProvider(provider: string) {
-  return availableOrgKeys.value.filter(k => k.provider === provider)
+function addProvider() {
+  if (!newProvider.value) return
+  llmConfigs.value.push({
+    provider: newProvider.value,
+    keySource: WORKING_PLAN_PROVIDERS.has(newProvider.value) ? 'org' : 'personal',
+    personalKey: '',
+    selectedModel: null,
+  })
+  newProvider.value = ''
 }
 
-async function fetchAvailableKeys() {
-  const orgId = authStore.user?.current_org_id
-  if (!orgId) return
-  try {
-    const res = await api.get(`/orgs/${orgId}/available-llm-keys`)
-    availableOrgKeys.value = res.data.data ?? []
-  } catch {
-    availableOrgKeys.value = []
+const BUILTIN_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'openrouter'])
+const WORKING_PLAN_PROVIDERS = new Set(['minimax-openai', 'minimax-anthropic'])
+
+async function handleFetchModels(provider: string, callback: (models: ModelItem[], error?: string) => void) {
+  const cfg = llmConfigs.value.find(c => c.provider === provider)
+  const params: Record<string, string> = {}
+  if (cfg?.keySource === 'personal' && cfg.personalKey) {
+    params.api_key = cfg.personalKey
   }
+  if (authStore.user?.org_id) {
+    params.org_id = authStore.user.org_id
+  }
+  try {
+    const res = await api.get(`/llm/providers/${provider}/models`, { params })
+    const msg = res.data?.message ?? ''
+    callback(res.data.data?.models ?? [], msg || undefined)
+  } catch (e: any) {
+    callback([], e?.response?.data?.message ?? '拉取模型列表失败')
+  }
+}
+
+function removeProvider(idx: number) {
+  llmConfigs.value.splice(idx, 1)
 }
 
 const storageAnchors = [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
@@ -125,11 +153,20 @@ function selectImage(tag: string) {
 }
 
 function toSlug(input: string): string {
-  const hasChinese = /[\u4e00-\u9fa5]/.test(input)
-  const raw = hasChinese
-    ? pinyin(input, { toneType: 'none', type: 'array' }).join('-')
-    : input
-  return raw
+  const segments = input.match(/[\u4e00-\u9fa5]+|[^\u4e00-\u9fa5]+/g) || []
+  const parts: string[] = []
+  for (const seg of segments) {
+    if (/[\u4e00-\u9fa5]/.test(seg)) {
+      parts.push(...pinyin(seg, { toneType: 'none', type: 'array' }))
+    } else {
+      parts.push(seg.trim())
+    }
+  }
+  return parts
+    .filter(Boolean)
+    .join('-')
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, '-')
     .replace(/-{2,}/g, '-')
@@ -178,7 +215,6 @@ onMounted(async () => {
     const [, clustersRes] = await Promise.all([
       fetchImageTags(),
       api.get('/clusters'),
-      fetchAvailableKeys(),
     ])
     clusters.value = (clustersRes.data.data ?? []).filter((c: any) => c.status === 'connected')
   } catch {
@@ -213,13 +249,11 @@ async function handleDeploy() {
   const res_spec = specResources[selectedSpec.value]
 
   try {
-    const activeLlm = llmConfigs.value
-      .filter(c => c.keySource !== 'none')
-      .map(c => ({
-        provider: c.provider,
-        key_source: c.keySource,
-        org_llm_key_id: c.keySource === 'org' ? c.orgKeyId || undefined : undefined,
-      }))
+    const activeLlm = llmConfigs.value.map(c => ({
+      provider: c.provider,
+      key_source: c.keySource,
+      selected_models: c.selectedModel ? [c.selectedModel] : undefined,
+    }))
 
     const res = await api.post('/deploy', {
       name: name.value.trim(),
@@ -259,251 +293,270 @@ async function handleDeploy() {
 
 <template>
   <div class="max-w-2xl mx-auto px-6 py-8">
-    <div class="flex items-center gap-3 mb-8">
-      <button class="p-1.5 rounded-lg hover:bg-muted transition-colors" @click="router.push('/instances')">
+    <div class="flex items-center gap-3 mb-6">
+      <button class="p-1.5 rounded-lg hover:bg-muted transition-colors" @click="currentStep === 1 ? router.push('/instances') : currentStep = 1">
         <ArrowLeft class="w-5 h-5" />
       </button>
       <div>
         <h1 class="text-xl font-bold">创建实例</h1>
-        <p class="text-sm text-muted-foreground mt-1">只需几步即可部署你的 AI 助手</p>
+        <p class="text-sm text-muted-foreground mt-0.5">只需几步即可部署你的 AI 助手</p>
       </div>
+    </div>
+
+    <!-- 步骤指示器 -->
+    <div class="flex items-center gap-3 mb-8">
+      <button
+        class="flex items-center gap-2 text-sm transition-colors"
+        :class="currentStep === 1 ? 'text-primary font-medium' : 'text-muted-foreground hover:text-foreground'"
+        @click="currentStep = 1"
+      >
+        <span
+          class="w-6 h-6 rounded-full text-xs flex items-center justify-center font-medium transition-colors"
+          :class="currentStep >= 1 ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'"
+        >1</span>
+        基本信息
+      </button>
+      <div class="flex-1 h-px" :class="currentStep >= 2 ? 'bg-primary' : 'bg-border'" />
+      <button
+        class="flex items-center gap-2 text-sm transition-colors"
+        :class="currentStep === 2 ? 'text-primary font-medium' : 'text-muted-foreground'"
+        :disabled="!canGoNext"
+        @click="canGoNext && (currentStep = 2)"
+      >
+        <span
+          class="w-6 h-6 rounded-full text-xs flex items-center justify-center font-medium transition-colors"
+          :class="currentStep >= 2 ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'"
+        >2</span>
+        大模型配置
+      </button>
     </div>
 
     <div v-if="loadingInit" class="flex items-center justify-center py-20">
       <Loader2 class="w-6 h-6 animate-spin text-muted-foreground" />
     </div>
 
-    <div v-else class="space-y-8">
-      <!-- 名称 -->
-      <div class="space-y-2">
-        <label class="text-sm font-medium">给你的 AI 助手取个名字</label>
-        <input
-          v-model="name"
-          type="text"
-          placeholder="例如：我的AI助手"
-          class="w-full px-4 py-2.5 rounded-lg bg-card border border-border text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
-        />
-      </div>
-
-      <!-- 实例标识 (slug) -->
-      <div class="space-y-2">
-        <div class="flex items-center gap-2">
-          <label class="text-sm font-medium">实例标识</label>
-          <span v-if="slug && !slugManuallyEdited" class="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">自动生成</span>
-        </div>
-        <div class="relative">
+    <template v-else>
+      <!-- ══ Step 1: 基本信息 ══ -->
+      <div v-if="currentStep === 1" class="space-y-8">
+        <!-- 名称 -->
+        <div class="space-y-2">
+          <label class="text-sm font-medium">给你的 AI 助手取个名字</label>
           <input
-            v-model="slug"
+            v-model="name"
             type="text"
-            placeholder="例如：my-assistant"
-            class="w-full px-4 py-2.5 rounded-lg bg-card border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
-            :class="slugError ? 'border-destructive' : slug && slugValid && !slugConflict ? 'border-green-500' : 'border-border'"
-            @input="slugManuallyEdited = true"
+            placeholder="例如：我的AI助手"
+            class="w-full px-4 py-2.5 rounded-lg bg-card border text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
+            :class="nameHasEdgeSpaces ? 'border-destructive' : 'border-border'"
           />
-          <div v-if="slugChecking" class="absolute right-3 top-1/2 -translate-y-1/2">
-            <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
-          </div>
-          <div v-else-if="slug && slugValid && !slugConflict && !slugChecking" class="absolute right-3 top-1/2 -translate-y-1/2">
-            <Check class="w-4 h-4 text-green-500" />
-          </div>
+          <p v-if="nameHasEdgeSpaces" class="text-xs text-destructive flex items-center gap-1">
+            <AlertCircle class="w-3 h-3" />
+            名称开头和结尾不能包含空格
+          </p>
         </div>
-        <p v-if="slugError" class="text-xs text-destructive flex items-center gap-1">
-          <AlertCircle class="w-3 h-3" />
-          {{ slugError }}
-        </p>
-        <p v-else-if="slug && !slugValid" class="text-xs text-destructive flex items-center gap-1">
-          <AlertCircle class="w-3 h-3" />
-          须以小写字母开头，仅含小写字母、数字和连字符，至少 2 个字符
-        </p>
-        <p v-else class="text-xs text-muted-foreground">
-          根据名称自动生成，也可手动修改
-        </p>
-      </div>
 
-      <!-- 镜像版本 -->
-      <div class="space-y-2">
-        <div class="flex items-center justify-between">
-          <label class="text-sm font-medium">镜像版本</label>
-          <button
-            class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-            :disabled="loadingTags"
-            @click="fetchImageTags"
-          >
-            <RefreshCw class="w-3 h-3" :class="loadingTags ? 'animate-spin' : ''" />
-            刷新
-          </button>
+        <!-- 实例标识 + 镜像版本 -->
+        <div class="grid grid-cols-2 gap-4">
+          <!-- 实例标识 (slug) -->
+          <div class="space-y-2">
+            <div class="flex items-center gap-2">
+              <label class="text-sm font-medium">实例标识</label>
+              <span v-if="slug && !slugManuallyEdited" class="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">自动生成</span>
+            </div>
+            <div class="relative">
+              <input
+                v-model="slug"
+                type="text"
+                placeholder="例如：my-assistant"
+                class="w-full px-4 py-2.5 rounded-lg bg-card border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
+                :class="slugError ? 'border-destructive' : slug && slugValid && !slugConflict ? 'border-green-500' : 'border-border'"
+                @input="slugManuallyEdited = true"
+              />
+              <div v-if="slugChecking" class="absolute right-3 top-1/2 -translate-y-1/2">
+                <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
+              </div>
+              <div v-else-if="slug && slugValid && !slugConflict && !slugChecking" class="absolute right-3 top-1/2 -translate-y-1/2">
+                <Check class="w-4 h-4 text-green-500" />
+              </div>
+            </div>
+            <p v-if="slugError" class="text-xs text-destructive flex items-center gap-1">
+              <AlertCircle class="w-3 h-3" />
+              {{ slugError }}
+            </p>
+            <p v-else-if="slug && !slugValid" class="text-xs text-destructive flex items-center gap-1">
+              <AlertCircle class="w-3 h-3" />
+              须以小写字母开头，仅含小写字母、数字和连字符，至少 2 个字符
+            </p>
+            <p v-else class="text-xs text-muted-foreground">
+              根据名称自动生成，也可手动修改
+            </p>
+          </div>
+
+          <!-- 镜像版本 -->
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <label class="text-sm font-medium">镜像版本</label>
+              <button
+                class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                :disabled="loadingTags"
+                @click="fetchImageTags"
+              >
+                <RefreshCw class="w-3 h-3" :class="loadingTags ? 'animate-spin' : ''" />
+                刷新
+              </button>
+            </div>
+            <div v-if="imageTags.length > 0" class="relative">
+              <button
+                class="w-full flex items-center justify-between px-4 py-2.5 rounded-lg bg-card border border-border text-sm hover:border-primary/50 transition-colors text-left"
+                @click="imageDropdownOpen = !imageDropdownOpen"
+              >
+                <span class="font-mono">{{ selectedImage || '选择版本' }}</span>
+                <ChevronDown class="w-4 h-4 text-muted-foreground transition-transform" :class="imageDropdownOpen ? 'rotate-180' : ''" />
+              </button>
+              <div
+                v-if="imageDropdownOpen"
+                class="absolute z-10 mt-1 w-full max-h-48 overflow-y-auto rounded-lg border border-border bg-card shadow-lg"
+              >
+                <button
+                  v-for="tag in imageTags"
+                  :key="tag"
+                  class="w-full px-4 py-2 text-left text-sm font-mono hover:bg-accent transition-colors"
+                  :class="tag === selectedImage ? 'text-primary bg-primary/5' : 'text-foreground'"
+                  @click="selectImage(tag)"
+                >
+                  {{ tag }}
+                  <span v-if="tag === imageTags[0]" class="ml-2 text-[10px] font-sans text-muted-foreground">(最新)</span>
+                </button>
+              </div>
+            </div>
+            <div v-else>
+              <input
+                v-model="selectedImage"
+                type="text"
+                :placeholder="loadingTags ? '加载中...' : '手动输入版本号'"
+                class="w-full px-4 py-2.5 rounded-lg bg-card border border-border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
+              />
+              <p class="text-xs text-muted-foreground mt-1">未获取到镜像仓库 Tag，请手动输入</p>
+            </div>
+          </div>
         </div>
-        <div v-if="imageTags.length > 0" class="relative">
-          <button
-            class="w-full flex items-center justify-between px-4 py-2.5 rounded-lg bg-card border border-border text-sm hover:border-primary/50 transition-colors text-left"
-            @click="imageDropdownOpen = !imageDropdownOpen"
-          >
-            <span class="font-mono">{{ selectedImage || '选择版本' }}</span>
-            <ChevronDown class="w-4 h-4 text-muted-foreground transition-transform" :class="imageDropdownOpen ? 'rotate-180' : ''" />
-          </button>
-          <div
-            v-if="imageDropdownOpen"
-            class="absolute z-10 mt-1 w-full max-h-48 overflow-y-auto rounded-lg border border-border bg-card shadow-lg"
-          >
+
+        <!-- 规格选择 -->
+        <div class="space-y-3">
+          <label class="text-sm font-medium">选择规格</label>
+          <div class="grid grid-cols-3 gap-3">
             <button
-              v-for="tag in imageTags"
-              :key="tag"
-              class="w-full px-4 py-2 text-left text-sm font-mono hover:bg-accent transition-colors"
-              :class="tag === selectedImage ? 'text-primary bg-primary/5' : 'text-foreground'"
-              @click="selectImage(tag)"
+              v-for="spec in specs"
+              :key="spec.key"
+              :class="[
+                'p-4 rounded-xl border text-left transition-all',
+                selectedSpec === spec.key
+                  ? 'border-primary bg-primary/5 ring-1 ring-primary/30'
+                  : 'border-border bg-card hover:border-primary/20',
+              ]"
+              @click="selectSpec(spec.key)"
             >
-              {{ tag }}
-              <span v-if="tag === imageTags[0]" class="ml-2 text-[10px] font-sans text-muted-foreground">(最新)</span>
+              <div class="font-medium text-sm">{{ spec.label }}</div>
+              <div class="text-xs text-muted-foreground mt-0.5">{{ spec.desc }}</div>
+              <div class="flex gap-3 mt-2 text-xs text-muted-foreground">
+                <span>{{ spec.cpu }}</span>
+                <span>{{ spec.mem }}</span>
+              </div>
             </button>
           </div>
         </div>
-        <div v-else>
-          <input
-            v-model="selectedImage"
-            type="text"
-            :placeholder="loadingTags ? '加载中...' : '手动输入版本号'"
-            class="w-full px-4 py-2.5 rounded-lg bg-card border border-border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
-          />
-          <p class="text-xs text-muted-foreground mt-1">未获取到镜像仓库 Tag，请手动输入</p>
-        </div>
-      </div>
 
-      <!-- 规格选择 -->
-      <div class="space-y-3">
-        <label class="text-sm font-medium">选择规格</label>
-        <div class="grid grid-cols-3 gap-3">
-          <button
-            v-for="spec in specs"
-            :key="spec.key"
-            :class="[
-              'p-4 rounded-xl border text-left transition-all',
-              selectedSpec === spec.key
-                ? 'border-primary bg-primary/5 ring-1 ring-primary/30'
-                : 'border-border bg-card hover:border-primary/20',
-            ]"
-            @click="selectSpec(spec.key)"
-          >
-            <div class="font-medium text-sm">{{ spec.label }}</div>
-            <div class="text-xs text-muted-foreground mt-0.5">{{ spec.desc }}</div>
-            <div class="flex gap-3 mt-2 text-xs text-muted-foreground">
-              <span>{{ spec.cpu }}</span>
-              <span>{{ spec.mem }}</span>
+        <!-- 存储空间 -->
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <label class="text-sm font-medium flex items-center gap-1.5">
+              <Database class="w-4 h-4 text-orange-400" />
+              存储空间
+            </label>
+            <span class="text-sm text-muted-foreground">当前：<span class="font-medium text-foreground">{{ storageGi }}Gi</span></span>
+          </div>
+          <div class="space-y-2">
+            <input
+              type="range"
+              :min="0"
+              :max="storageAnchors.length - 1"
+              :step="1"
+              :value="storageIndex"
+              class="w-full h-2 rounded-full appearance-none cursor-pointer accent-primary bg-muted"
+              @input="(e: Event) => storageIndex = Number((e.target as HTMLInputElement).value)"
+            />
+            <div class="relative h-5 text-xs text-muted-foreground">
+              <span
+                v-for="(label, i) in storageLabels"
+                :key="label"
+                class="absolute cursor-pointer py-0.5 rounded transition-colors"
+                :class="storageGi === label ? 'text-primary font-medium' : ''"
+                :style="{
+                  left: (storageAnchors.indexOf(label) / (storageAnchors.length - 1) * 100) + '%',
+                  transform: i === 0 ? 'none' : i === storageLabels.length - 1 ? 'translateX(-100%)' : 'translateX(-50%)',
+                }"
+                @click="storageIndex = storageAnchors.indexOf(label)"
+              >
+                {{ label }}Gi
+              </span>
             </div>
+          </div>
+        </div>
+
+        <!-- 下一步 -->
+        <div class="pt-4">
+          <button
+            :disabled="!canGoNext"
+            class="w-full py-3 px-4 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+            @click="currentStep = 2"
+          >
+            下一步
+            <ArrowRight class="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      <!-- 存储空间 -->
-      <div class="space-y-3">
-        <label class="text-sm font-medium flex items-center gap-1.5">
-          <Database class="w-4 h-4 text-orange-400" />
-          存储空间
-        </label>
-        <div class="space-y-2">
-          <input
-            type="range"
-            :min="0"
-            :max="storageAnchors.length - 1"
-            :step="1"
-            :value="storageIndex"
-            class="w-full h-2 rounded-full appearance-none cursor-pointer accent-primary bg-muted"
-            @input="(e: Event) => storageIndex = Number((e.target as HTMLInputElement).value)"
-          />
-          <div class="relative h-5 text-xs text-muted-foreground">
-            <span
-              v-for="(label, i) in storageLabels"
-              :key="label"
-              class="absolute cursor-pointer py-0.5 rounded transition-colors"
-              :class="storageGi === label ? 'text-primary font-medium' : ''"
-              :style="{
-                left: (storageAnchors.indexOf(label) / (storageAnchors.length - 1) * 100) + '%',
-                transform: i === 0 ? 'none' : i === storageLabels.length - 1 ? 'translateX(-100%)' : 'translateX(-50%)',
-              }"
-              @click="storageIndex = storageAnchors.indexOf(label)"
-            >
-              {{ label }}Gi
-            </span>
+      <!-- ══ Step 2: 大模型配置 ══ -->
+      <div v-if="currentStep === 2" class="space-y-6">
+        <div class="space-y-3">
+          <div class="flex items-center gap-2">
+            <Brain class="w-4 h-4 text-violet-400" />
+            <label class="text-sm font-medium">配置大模型</label>
           </div>
           <p class="text-xs text-muted-foreground">
-            当前：<span class="font-medium text-foreground">{{ storageGi }}Gi</span>
+            OpenClaw 需要至少一个大模型 API Key 才能正常使用
           </p>
-        </div>
-      </div>
 
-      <!-- 大模型配置 -->
-      <div class="space-y-3">
-        <button
-          class="flex items-center gap-2 text-sm font-medium w-full text-left"
-          @click="llmExpanded = !llmExpanded"
-        >
-          <Brain class="w-4 h-4 text-violet-400" />
-          配置大模型
-          <ChevronDown class="w-4 h-4 text-muted-foreground transition-transform ml-auto" :class="llmExpanded ? 'rotate-180' : ''" />
-        </button>
-        <p class="text-xs text-muted-foreground">
-          OpenClaw 需要至少一个大模型 Key 才能正常使用，你也可以稍后在实例设置中配置
-        </p>
+          <template v-if="!llmSkipped">
+            <!-- 已添加的 Provider -->
+            <div v-for="(cfg, idx) in llmConfigs" :key="cfg.provider" class="rounded-lg border border-border bg-card p-4 space-y-3">
+              <div class="flex items-center justify-between">
+                <span class="font-medium text-sm">{{ PROVIDER_LABELS[cfg.provider] || cfg.provider }}</span>
+                <button class="text-muted-foreground hover:text-destructive transition-colors" @click="removeProvider(idx)">
+                  <Trash2 class="w-4 h-4" />
+                </button>
+              </div>
 
-        <div v-if="llmExpanded" class="space-y-3">
-          <div
-            v-for="cfg in llmConfigs"
-            :key="cfg.provider"
-            class="rounded-lg border border-border bg-card p-4 space-y-3"
-          >
-            <div class="font-medium text-sm">{{ PROVIDER_LABELS[cfg.provider] || cfg.provider }}</div>
+              <div class="space-y-2">
+                <div class="flex gap-4 text-sm">
+                  <label
+                    class="flex items-center gap-1.5"
+                    :class="WORKING_PLAN_PROVIDERS.has(cfg.provider) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'"
+                    :title="WORKING_PLAN_PROVIDERS.has(cfg.provider) ? '' : '暂未开放'"
+                  >
+                    <input type="radio" :name="`llm-${cfg.provider}`" value="org" v-model="cfg.keySource" class="accent-primary" :disabled="!WORKING_PLAN_PROVIDERS.has(cfg.provider)" />
+                    Working Plan
+                  </label>
+                  <label class="flex items-center gap-1.5 cursor-pointer">
+                    <input type="radio" :name="`llm-${cfg.provider}`" value="personal" v-model="cfg.keySource" class="accent-primary" />
+                    个人 Key
+                  </label>
+                </div>
 
-            <div class="space-y-2">
-              <label class="flex items-center gap-2 text-sm cursor-pointer">
-                <input
-                  type="radio"
-                  :name="`llm-${cfg.provider}`"
-                  value="none"
-                  v-model="cfg.keySource"
-                  class="accent-primary"
-                />
-                <span class="text-muted-foreground">不使用</span>
-              </label>
+                <p v-if="cfg.keySource === 'org'" class="text-xs text-muted-foreground pl-0.5">
+                  使用组织统一配置的 Key，无需自行输入
+                </p>
 
-              <label
-                v-if="orgKeysForProvider(cfg.provider).length > 0"
-                class="flex items-center gap-2 text-sm cursor-pointer"
-              >
-                <input
-                  type="radio"
-                  :name="`llm-${cfg.provider}`"
-                  value="org"
-                  v-model="cfg.keySource"
-                  class="accent-primary"
-                />
-                <span>使用组织 Key</span>
-              </label>
-              <select
-                v-if="cfg.keySource === 'org' && orgKeysForProvider(cfg.provider).length > 0"
-                v-model="cfg.orgKeyId"
-                class="ml-6 w-[calc(100%-1.5rem)] px-3 py-1.5 rounded-md bg-background border border-border text-sm focus:outline-none focus:ring-1 focus:ring-primary/50"
-              >
-                <option value="" disabled>选择 Key</option>
-                <option
-                  v-for="k in orgKeysForProvider(cfg.provider)"
-                  :key="k.id"
-                  :value="k.id"
-                >
-                  {{ k.label }} ({{ k.api_key_masked }})
-                </option>
-              </select>
-
-              <label class="flex items-center gap-2 text-sm cursor-pointer">
-                <input
-                  type="radio"
-                  :name="`llm-${cfg.provider}`"
-                  value="personal"
-                  v-model="cfg.keySource"
-                  class="accent-primary"
-                />
-                <span>使用个人 Key</span>
-              </label>
-              <div v-if="cfg.keySource === 'personal'" class="ml-6">
-                <div class="relative">
+                <div v-if="cfg.keySource === 'personal'" class="relative">
                   <Key class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
                   <input
                     v-model="cfg.personalKey"
@@ -513,29 +566,66 @@ async function handleDeploy() {
                   />
                 </div>
               </div>
+
+              <!-- Model selection -->
+              <ModelSelect
+                :provider="cfg.provider"
+                v-model="cfg.selectedModel"
+                @fetch-models="handleFetchModels"
+              />
+              <p v-if="!BUILTIN_PROVIDERS.has(cfg.provider) && !cfg.selectedModel" class="text-[10px] text-amber-500">
+                自定义 Provider 需要选择一个模型
+              </p>
             </div>
-          </div>
+
+            <!-- 选择 Provider -->
+            <div v-if="llmConfigs.length === 0 && unusedProviders.length > 0" class="space-y-2">
+              <p class="text-xs text-muted-foreground">选择你使用的大模型服务商</p>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  v-for="p in unusedProviders"
+                  :key="p"
+                  class="px-4 py-3 rounded-lg border border-border bg-card text-sm text-left hover:border-primary/50 hover:bg-primary/5 transition-colors cursor-pointer"
+                  @click="newProvider = p; addProvider()"
+                >
+                  {{ PROVIDER_LABELS[p] || p }}
+                </button>
+              </div>
+            </div>
+          </template>
+
+          <p v-else class="text-xs text-muted-foreground italic">
+            已跳过大模型配置，创建后可在实例设置中配置
+            <button class="text-primary ml-1 not-italic" @click="llmSkipped = false">撤销</button>
+          </p>
+        </div>
+
+        <!-- 部署 -->
+        <div class="pt-4 space-y-3">
+          <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
+          <button
+            :disabled="!canDeploy"
+            class="w-full py-3 px-4 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+            @click="handleDeploy"
+          >
+            <Loader2 v-if="deploying" class="w-4 h-4 animate-spin" />
+            <Rocket v-else class="w-4 h-4" />
+            {{ deploying ? '部署中...' : '部署' }}
+          </button>
+          <button
+            v-if="!llmSkipped"
+            class="w-full py-2.5 px-4 rounded-lg border border-border text-sm text-muted-foreground hover:text-foreground hover:border-foreground/20 transition-colors text-center cursor-pointer"
+            @click="llmSkipped = true; llmConfigs.splice(0); handleDeploy()"
+          >
+            跳过，稍后配置大模型
+          </button>
         </div>
       </div>
-
-      <!-- 部署 -->
-      <div class="pt-4">
-        <p v-if="error" class="text-sm text-destructive mb-3">{{ error }}</p>
-        <button
-          :disabled="!canDeploy"
-          class="w-full py-3 px-4 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
-          @click="handleDeploy"
-        >
-          <Loader2 v-if="deploying" class="w-4 h-4 animate-spin" />
-          <Rocket v-else class="w-4 h-4" />
-          {{ deploying ? '部署中...' : '一键部署' }}
-        </button>
-      </div>
-    </div>
+    </template>
   </div>
 
   <!-- 点击外部关闭下拉框 -->
   <Teleport to="body">
-    <div v-if="imageDropdownOpen" class="fixed inset-0 z-[5]" @click="imageDropdownOpen = false" />
+    <div v-if="imageDropdownOpen" class="fixed inset-0 z-5" @click="imageDropdownOpen = false" />
   </Teleport>
 </template>

@@ -1,13 +1,10 @@
 """Workspace CRUD + Agent management + Blackboard service."""
 
 import logging
-from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent_share_config import AgentShareConfig
-from app.models.agent_subscription import AgentSubscription
 from app.models.blackboard import Blackboard
 from app.models.instance import Instance
 from app.models.workspace import Workspace
@@ -185,13 +182,11 @@ async def add_agent(db: AsyncSession, workspace_id: str, data: AddAgentRequest) 
     inst.workspace_id = workspace_id
     inst.agent_display_name = data.display_name
 
-    share = AgentShareConfig(instance_id=inst.id, workspace_id=workspace_id)
-    db.add(share)
-    sub = AgentSubscription(instance_id=inst.id, workspace_id=workspace_id)
-    db.add(sub)
-
     await db.commit()
     await db.refresh(inst)
+
+    await _deploy_channel_plugin(inst, db, workspace_id)
+
     return _agent_brief(inst)
 
 
@@ -227,23 +222,13 @@ async def remove_agent(db: AsyncSession, workspace_id: str, instance_id: str) ->
     if inst is None:
         return False
 
+    await _remove_channel_plugin(inst, db)
+
     inst.workspace_id = None
     inst.hex_position_q = 0
     inst.hex_position_r = 0
     inst.agent_display_name = None
 
-    await db.execute(
-        delete(AgentShareConfig).where(
-            AgentShareConfig.instance_id == instance_id,
-            AgentShareConfig.workspace_id == workspace_id,
-        )
-    )
-    await db.execute(
-        delete(AgentSubscription).where(
-            AgentSubscription.instance_id == instance_id,
-            AgentSubscription.workspace_id == workspace_id,
-        )
-    )
     await db.commit()
     return True
 
@@ -271,6 +256,45 @@ async def update_agent(
     await db.commit()
     await db.refresh(inst)
     return _agent_brief(inst)
+
+
+# ── Channel Plugin Deploy ────────────────────────────
+
+async def _deploy_channel_plugin(inst: Instance, db: AsyncSession, workspace_id: str) -> None:
+    """Deploy clawbuddy channel plugin config + restart instance + connect SSE."""
+    try:
+        from app.services.llm_config_service import deploy_clawbuddy_channel_plugin
+        await deploy_clawbuddy_channel_plugin(inst, db, workspace_id)
+    except Exception as e:
+        logger.error("部署 channel plugin 失败（非致命）: instance=%s error=%s", inst.name, e)
+        return
+
+    try:
+        from app.services.instance_service import restart_instance
+        await restart_instance(inst.id, db)
+        logger.info("已重启实例以加载 channel plugin: %s", inst.name)
+    except Exception as e:
+        logger.warning("重启实例失败（非致命）: instance=%s error=%s", inst.name, e)
+
+    if inst.ingress_domain:
+        from app.services.sse_listener import sse_listener_manager
+        await sse_listener_manager.connect(
+            inst.id,
+            inst.ingress_domain,
+            delay=15,
+        )
+
+
+async def _remove_channel_plugin(inst: Instance, db: AsyncSession) -> None:
+    """Disconnect SSE + remove clawbuddy channel plugin config."""
+    from app.services.sse_listener import sse_listener_manager
+    await sse_listener_manager.disconnect(inst.id)
+
+    try:
+        from app.services.llm_config_service import remove_clawbuddy_channel_plugin
+        await remove_clawbuddy_channel_plugin(inst, db)
+    except Exception as e:
+        logger.error("移除 channel plugin 失败（非致命）: instance=%s error=%s", inst.name, e)
 
 
 # ── Blackboard ───────────────────────────────────────

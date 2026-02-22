@@ -10,10 +10,12 @@ from kubernetes_asyncio.client import (
     V1ContainerPort,
     V1Deployment,
     V1DeploymentSpec,
+    V1DeploymentStrategy,
     V1EmptyDirVolumeSource,
     V1EnvVar,
     V1EnvVarSource,
     V1ConfigMapKeySelector,
+    V1HTTPGetAction,
     V1HTTPIngressPath,
     V1HTTPIngressRuleValue,
     V1Ingress,
@@ -30,6 +32,7 @@ from kubernetes_asyncio.client import (
     V1PersistentVolumeClaimSpec,
     V1PodSpec,
     V1PodTemplateSpec,
+    V1Probe,
     V1ResourceQuota,
     V1ResourceQuotaSpec,
     V1ResourceRequirements,
@@ -311,16 +314,41 @@ def build_deployment(
                 )
             )
 
+    http_get = V1HTTPGetAction(path="/", port=port)
+
     container = V1Container(
         name=name,
         image=image,
-        ports=[V1ContainerPort(container_port=port)],
+        ports=[
+            V1ContainerPort(container_port=port),
+            V1ContainerPort(container_port=9721, name="sse"),
+        ],
         env=env or None,
         resources=V1ResourceRequirements(
             requests={"cpu": cpu_request, "memory": mem_request},
             limits={"cpu": cpu_limit, "memory": mem_limit},
         ),
         volume_mounts=volume_mounts or None,
+        startup_probe=V1Probe(
+            http_get=http_get,
+            initial_delay_seconds=5,
+            period_seconds=3,
+            failure_threshold=20,
+            timeout_seconds=2,
+        ),
+        readiness_probe=V1Probe(
+            http_get=http_get,
+            period_seconds=5,
+            failure_threshold=3,
+            success_threshold=1,
+            timeout_seconds=2,
+        ),
+        liveness_probe=V1Probe(
+            http_get=http_get,
+            period_seconds=15,
+            failure_threshold=3,
+            timeout_seconds=3,
+        ),
     )
 
     # ── Advanced config: sidecar containers ──
@@ -361,6 +389,7 @@ def build_deployment(
         metadata=V1ObjectMeta(name=name, namespace=namespace, labels=labels),
         spec=V1DeploymentSpec(
             replicas=replicas,
+            strategy=V1DeploymentStrategy(type="Recreate"),
             selector=V1LabelSelector(match_labels={"app.kubernetes.io/name": labels["app.kubernetes.io/name"]}),
             template=V1PodTemplateSpec(
                 metadata=V1ObjectMeta(labels=pod_labels, annotations=pod_annotations),
@@ -426,12 +455,15 @@ def build_service(
     labels: dict,
     port: int = 18789,
 ) -> V1Service:
-    """构建 ClusterIP Service，端口默认 18789（OpenClaw Gateway 端口）。"""
+    """构建 ClusterIP Service，端口默认 18789（OpenClaw Gateway）+ 9721（SSE）。"""
     return V1Service(
         metadata=V1ObjectMeta(name=name, namespace=namespace, labels=labels),
         spec=V1ServiceSpec(
             selector={"app.kubernetes.io/name": labels["app.kubernetes.io/name"]},
-            ports=[V1ServicePort(port=port, target_port=port, protocol="TCP")],
+            ports=[
+                V1ServicePort(port=port, target_port=port, protocol="TCP", name="gateway"),
+                V1ServicePort(port=9721, target_port=9721, protocol="TCP", name="sse"),
+            ],
             type="ClusterIP",
         ),
     )
@@ -455,11 +487,10 @@ def build_ingress(
     svc_name = service_name or name
 
     annotations: dict[str, str] = {
-        # WebSocket 长连接支持（OpenClaw 需要 WebSocket）
-        "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+        "nginx.ingress.kubernetes.io/proxy-read-timeout": "86400",
         "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600",
         "nginx.ingress.kubernetes.io/proxy-http-version": "1.1",
-        # WebSocket 升级头由 Ingress Controller 全局配置处理，无需单独指定 proxy-set-headers
+        "nginx.ingress.kubernetes.io/proxy-buffering": "off",
     }
 
     # TLS 配置
@@ -484,6 +515,16 @@ def build_ingress(
                     http=V1HTTPIngressRuleValue(
                         paths=[
                             V1HTTPIngressPath(
+                                path="/sse/",
+                                path_type="Prefix",
+                                backend=V1IngressBackend(
+                                    service=V1IngressServiceBackend(
+                                        name=svc_name,
+                                        port=V1ServiceBackendPort(number=9721),
+                                    )
+                                ),
+                            ),
+                            V1HTTPIngressPath(
                                 path="/",
                                 path_type="Prefix",
                                 backend=V1IngressBackend(
@@ -492,7 +533,7 @@ def build_ingress(
                                         port=V1ServiceBackendPort(number=port),
                                     )
                                 ),
-                            )
+                            ),
                         ]
                     ),
                 )

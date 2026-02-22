@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, ExternalLink, RefreshCw, Trash2, Circle, Loader2, Settings } from 'lucide-vue-next'
+import { ref, onMounted, onUnmounted, inject, type Ref, type ComputedRef } from 'vue'
+import { useRouter } from 'vue-router'
+import { ExternalLink, RefreshCw, Trash2, Circle, Loader2, Copy, Check, RotateCcw, AlertTriangle } from 'lucide-vue-next'
 import api from '@/services/api'
+import { useToast } from '@/composables/useToast'
 
-const route = useRoute()
 const router = useRouter()
-const instanceId = computed(() => route.params.id as string)
+const toast = useToast()
+const instanceId = inject<ComputedRef<string>>('instanceId')!
+const instanceBasic = inject<Ref<{ name: string } | null>>('instanceBasic')!
+const refreshInstanceBasic = inject<() => Promise<void>>('refreshInstanceBasic')!
 
 interface InstanceDetail {
   id: string
@@ -21,18 +24,50 @@ interface InstanceDetail {
   cpu_limit: string
   mem_request: string
   mem_limit: string
-  env_vars: string | null
+  env_vars: Record<string, string> | null
   created_at: string
   pods: { name: string; status: string; ready: boolean; restart_count: number }[]
 }
 
 const instance = ref<InstanceDetail | null>(null)
 const loading = ref(true)
-const error = ref('')
+const pageError = ref('')
 const openclawUrl = ref('')
+const urlCopied = ref(false)
+const restarting = ref(false)
+const showRestartDialog = ref(false)
+const showDeleteDialog = ref(false)
+const deleting = ref(false)
+
+let pollTimer: ReturnType<typeof setInterval> | null = null
+let pollTimeout: ReturnType<typeof setTimeout> | null = null
+
+function formatCpu(val: string): string {
+  if (val.endsWith('m')) {
+    const cores = parseInt(val.slice(0, -1), 10) / 1000
+    return Number.isInteger(cores) ? `${cores} 核` : `${cores.toFixed(2)} 核`
+  }
+  return `${val} 核`
+}
+
+async function copyUrl() {
+  try {
+    await navigator.clipboard.writeText(openclawUrl.value)
+    urlCopied.value = true
+    setTimeout(() => { urlCopied.value = false }, 2000)
+  } catch { /* ignore */ }
+}
 
 onMounted(async () => {
   await fetchDetail()
+  if (instance.value?.status === 'restarting') {
+    restarting.value = true
+    startPolling()
+  }
+})
+
+onUnmounted(() => {
+  stopPolling()
 })
 
 async function fetchDetail() {
@@ -41,79 +76,108 @@ async function fetchDetail() {
     const res = await api.get(`/instances/${instanceId.value}`)
     instance.value = res.data.data
 
-    // 构造 OpenClaw 访问地址
     if (instance.value?.ingress_domain && instance.value.env_vars) {
-      try {
-        const envs = JSON.parse(instance.value.env_vars)
-        const token = envs.OPENCLAW_GATEWAY_TOKEN
-        if (token) {
-          openclawUrl.value = `https://${instance.value.ingress_domain}?token=${token}`
-        }
-      } catch { /* ignore */ }
+      const token = instance.value.env_vars.OPENCLAW_GATEWAY_TOKEN
+      if (token) {
+        openclawUrl.value = `https://${instance.value.ingress_domain}?token=${token}`
+      }
     }
   } catch (e: any) {
-    error.value = e?.response?.data?.message || '加载失败'
+    pageError.value = e?.response?.data?.message || '加载失败'
   } finally {
     loading.value = false
   }
 }
 
-async function handleDelete() {
-  if (!confirm(`确定删除实例「${instance.value?.name}」？此操作不可恢复。`)) return
+async function pollOnce() {
   try {
-    await api.delete(`/instances/${instanceId.value}`)
-    router.push('/instances')
-  } catch (e: any) {
-    error.value = e?.response?.data?.message || '删除失败'
+    const res = await api.get(`/instances/${instanceId.value}`)
+    instance.value = res.data.data
+    await refreshInstanceBasic()
+
+    if (instance.value && instance.value.status !== 'restarting') {
+      stopPolling()
+      restarting.value = false
+      toast.success('重启完成，实例已恢复运行')
+    }
+  } catch {
+    // 轮询期间忽略网络错误
   }
 }
 
-const statusColors: Record<string, string> = {
-  running: 'text-green-400',
-  deploying: 'text-yellow-400',
-  failed: 'text-red-400',
+function startPolling() {
+  stopPolling()
+  pollTimer = setInterval(pollOnce, 3000)
+  pollTimeout = setTimeout(() => {
+    stopPolling()
+    restarting.value = false
+    toast.error('重启超时，请手动刷新查看状态')
+  }, 120_000)
 }
-const statusLabels: Record<string, string> = {
-  running: '运行中',
-  deploying: '部署中',
-  creating: '创建中',
-  updating: '更新中',
-  failed: '异常',
-  pending: '等待中',
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+  if (pollTimeout) { clearTimeout(pollTimeout); pollTimeout = null }
+}
+
+async function handleRestart() {
+  showRestartDialog.value = false
+  restarting.value = true
+  try {
+    const res = await api.post(`/instances/${instanceId.value}/restart`)
+    toast.success(res.data?.message || '已触发重启，实例将在数秒后恢复')
+    await refreshInstanceBasic()
+    startPolling()
+  } catch (e: any) {
+    restarting.value = false
+    const msg = e?.response?.data?.message || e?.message || '重启失败'
+    toast.error(msg)
+    console.error('[handleRestart]', e)
+  }
+}
+
+async function handleDelete() {
+  showDeleteDialog.value = false
+  deleting.value = true
+  try {
+    await api.delete(`/instances/${instanceId.value}`)
+    toast.success('实例已删除')
+    router.push('/instances')
+  } catch (e: any) {
+    deleting.value = false
+    toast.error(e?.response?.data?.message || '删除失败')
+  }
 }
 </script>
 
 <template>
-  <div class="max-w-3xl mx-auto px-6 py-8">
-    <!-- Header -->
-    <div class="flex items-center gap-3 mb-6">
-      <button class="text-muted-foreground hover:text-foreground" @click="router.push('/instances')">
-        <ArrowLeft class="w-5 h-5" />
-      </button>
-      <div v-if="instance" class="flex items-center gap-3">
-        <h1 class="text-xl font-bold">{{ instance.name }}</h1>
-        <span class="flex items-center gap-1 text-xs" :class="statusColors[instance.status] || 'text-zinc-400'">
-          <Circle class="w-2 h-2 fill-current" />
-          {{ statusLabels[instance.status] || instance.status }}
-        </span>
-      </div>
-    </div>
-
+  <div>
     <div v-if="loading" class="flex items-center justify-center py-20">
       <Loader2 class="w-6 h-6 animate-spin text-muted-foreground" />
     </div>
 
-    <div v-else-if="error" class="text-center py-20 text-destructive">{{ error }}</div>
+    <div v-else-if="pageError" class="text-center py-20 text-destructive">{{ pageError }}</div>
 
     <div v-else-if="instance" class="space-y-6">
       <!-- OpenClaw 访问 -->
-      <div v-if="openclawUrl" class="p-4 rounded-xl border border-primary/30 bg-primary/5">
+      <div v-if="openclawUrl" class="p-4 rounded-xl border border-primary/30 bg-primary/5 space-y-3">
         <div class="flex items-center justify-between">
           <div>
             <p class="text-sm font-medium">OpenClaw 访问地址</p>
-            <p class="text-xs text-muted-foreground mt-0.5">点击即可打开 AI 助手</p>
+            <p class="text-xs text-muted-foreground mt-0.5">
+              {{ restarting ? '实例正在重启，请稍候...' : '点击即可打开 AI 助手' }}
+            </p>
           </div>
+          <button
+            v-if="restarting"
+            disabled
+            class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-muted text-muted-foreground text-sm font-medium cursor-not-allowed"
+          >
+            <Loader2 class="w-4 h-4 animate-spin" />
+            重启中
+          </button>
           <a
+            v-else
             :href="openclawUrl"
             target="_blank"
             class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
@@ -121,6 +185,21 @@ const statusLabels: Record<string, string> = {
             <ExternalLink class="w-4 h-4" />
             打开
           </a>
+        </div>
+        <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-background/60 border border-border/50">
+          <a
+            :href="openclawUrl"
+            target="_blank"
+            class="flex-1 text-xs font-mono truncate transition-colors"
+            :class="restarting ? 'text-muted-foreground pointer-events-none' : 'text-primary/80 hover:text-primary'"
+          >{{ openclawUrl }}</a>
+          <button
+            class="shrink-0 p-1 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+            @click="copyUrl"
+          >
+            <Check v-if="urlCopied" class="w-3.5 h-3.5 text-green-400" />
+            <Copy v-else class="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
 
@@ -133,12 +212,8 @@ const statusLabels: Record<string, string> = {
             <span class="ml-2 font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{{ instance.image_version }}</span>
           </div>
           <div>
-            <span class="text-muted-foreground">副本</span>
-            <span class="ml-2">{{ instance.available_replicas }}/{{ instance.replicas }}</span>
-          </div>
-          <div>
             <span class="text-muted-foreground">CPU</span>
-            <span class="ml-2">{{ instance.cpu_limit }}</span>
+            <span class="ml-2">{{ formatCpu(instance.cpu_limit) }}</span>
           </div>
           <div>
             <span class="text-muted-foreground">内存</span>
@@ -173,6 +248,12 @@ const statusLabels: Record<string, string> = {
           </div>
         </div>
       </div>
+      <div v-else-if="restarting" class="p-4 rounded-xl border border-amber-500/20 bg-amber-500/5">
+        <div class="flex items-center gap-2 text-sm text-amber-400">
+          <Loader2 class="w-4 h-4 animate-spin" />
+          实例正在重启，等待新 Pod 启动...
+        </div>
+      </div>
 
       <!-- 操作 -->
       <div class="flex items-center gap-3 pt-4 border-t border-border">
@@ -184,20 +265,112 @@ const statusLabels: Record<string, string> = {
           刷新
         </button>
         <button
-          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-border text-sm hover:bg-card transition-colors"
-          @click="router.push(`/instances/${instanceId}/settings`)"
+          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-amber-500/30 text-amber-400 text-sm hover:bg-amber-500/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          :disabled="restarting"
+          @click="showRestartDialog = true"
         >
-          <Settings class="w-4 h-4" />
-          设置
+          <RotateCcw class="w-4 h-4" :class="restarting ? 'animate-spin' : ''" />
+          {{ restarting ? '重启中...' : '重启实例' }}
         </button>
         <button
-          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-red-500/30 text-red-400 text-sm hover:bg-red-500/10 transition-colors ml-auto"
-          @click="handleDelete"
+          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-red-500/30 text-red-400 text-sm hover:bg-red-500/10 transition-colors ml-auto disabled:opacity-50 disabled:cursor-not-allowed"
+          :disabled="deleting"
+          @click="showDeleteDialog = true"
         >
-          <Trash2 class="w-4 h-4" />
-          删除实例
+          <Loader2 v-if="deleting" class="w-4 h-4 animate-spin" />
+          <Trash2 v-else class="w-4 h-4" />
+          {{ deleting ? '删除中...' : '删除实例' }}
         </button>
       </div>
     </div>
+
+    <!-- 重启确认弹窗 -->
+    <Teleport to="body">
+      <Transition name="fade">
+        <div v-if="showRestartDialog" class="fixed inset-0 z-50 flex items-center justify-center">
+          <div class="absolute inset-0 bg-black/50" @click="showRestartDialog = false" />
+          <div class="relative bg-card border border-border rounded-xl p-6 w-full max-w-sm shadow-lg space-y-4">
+            <div class="flex items-center gap-3">
+              <div class="p-2 rounded-lg bg-amber-500/10">
+                <AlertTriangle class="w-5 h-5 text-amber-400" />
+              </div>
+              <h3 class="text-base font-semibold">重启实例</h3>
+            </div>
+            <div class="text-sm text-muted-foreground space-y-2">
+              <p>即将重启实例，这将会：</p>
+              <ul class="list-disc list-inside space-y-1 text-xs">
+                <li>关闭实例中所有运行的程序</li>
+                <li>重启期间服务将短暂不可用</li>
+                <li>正在进行的对话和任务会被中断</li>
+              </ul>
+            </div>
+            <div class="flex justify-end gap-3 pt-2">
+              <button
+                class="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors"
+                @click="showRestartDialog = false"
+              >
+                取消
+              </button>
+              <button
+                class="px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:bg-amber-600 transition-colors"
+                @click="handleRestart"
+              >
+                确认重启
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 删除确认弹窗 -->
+    <Teleport to="body">
+      <Transition name="fade">
+        <div v-if="showDeleteDialog" class="fixed inset-0 z-50 flex items-center justify-center">
+          <div class="absolute inset-0 bg-black/50" @click="showDeleteDialog = false" />
+          <div class="relative bg-card border border-border rounded-xl p-6 w-full max-w-sm shadow-lg space-y-4">
+            <div class="flex items-center gap-3">
+              <div class="p-2 rounded-lg bg-red-500/10">
+                <AlertTriangle class="w-5 h-5 text-red-400" />
+              </div>
+              <h3 class="text-base font-semibold">删除实例</h3>
+            </div>
+            <div class="text-sm text-muted-foreground space-y-2">
+              <p>确定删除实例「<span class="text-foreground font-medium">{{ instanceBasic?.name }}</span>」？</p>
+              <ul class="list-disc list-inside space-y-1 text-xs">
+                <li>实例及其 K8s 资源将被永久删除</li>
+                <li>所有对话记录和工作区数据将丢失</li>
+                <li>此操作不可恢复</li>
+              </ul>
+            </div>
+            <div class="flex justify-end gap-3 pt-2">
+              <button
+                class="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors"
+                @click="showDeleteDialog = false"
+              >
+                取消
+              </button>
+              <button
+                class="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-600 transition-colors"
+                @click="handleDelete"
+              >
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
+
+<style scoped>
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+</style>

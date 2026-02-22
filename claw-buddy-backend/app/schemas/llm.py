@@ -3,6 +3,20 @@
 from pydantic import BaseModel, Field
 
 
+# ── Model Info ───────────────────────────────────────────
+
+class ModelInfo(BaseModel):
+    id: str
+    name: str
+    context_window: int | None = None
+    max_tokens: int | None = None
+
+
+class ProviderModelsResponse(BaseModel):
+    provider: str
+    models: list[ModelInfo]
+
+
 # ── Org LLM Key ──────────────────────────────────────────
 
 class OrgLlmKeyCreate(BaseModel):
@@ -62,7 +76,7 @@ class UserLlmKeyInfo(BaseModel):
 class LlmConfigItem(BaseModel):
     provider: str
     key_source: str = Field(..., pattern=r"^(org|personal)$")
-    org_llm_key_id: str | None = None
+    selected_models: list[dict] | None = None
 
 
 class UserLlmConfigUpdate(BaseModel):
@@ -73,8 +87,7 @@ class UserLlmConfigUpdate(BaseModel):
 class UserLlmConfigInfo(BaseModel):
     provider: str
     key_source: str
-    org_llm_key_id: str | None = None
-    org_llm_key_label: str | None = None
+    selected_models: list[dict] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -89,7 +102,6 @@ class LlmConfigUpdateResult(BaseModel):
 class InstanceLlmConfigInfo(BaseModel):
     provider: str
     key_source: str
-    key_label: str | None = None
     api_key_masked: str | None = None
 
 
@@ -101,3 +113,18 @@ class AvailableLlmKey(BaseModel):
     label: str
     api_key_masked: str
     is_active: bool
+
+
+# ── OpenClaw Pod Provider Config (live read) ────────────
+
+class OpenClawProviderEntry(BaseModel):
+    provider: str
+    base_url: str
+    is_proxy: bool
+    key_source: str | None = None
+    api_key_masked: str | None = None
+
+
+class OpenClawConfigResponse(BaseModel):
+    data_source: str
+    providers: list[OpenClawProviderEntry]
