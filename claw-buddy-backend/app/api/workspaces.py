@@ -7,6 +7,7 @@ from datetime import timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +41,11 @@ def _ok(data=None, message: str = "success"):
 def _get_current_user_dep():
     from app.core.security import get_current_user
     return get_current_user
+
+
+def _get_current_user_from_query_dep():
+    from app.core.security import get_current_user_from_query
+    return get_current_user_from_query
 
 
 # ── Workspace CRUD ───────────────────────────────────
@@ -271,10 +277,44 @@ async def workspace_chat(
                 user_name=user.name,
                 user_message=data.message,
                 ws_name=ws_info.name,
+                mentions=data.mentions,
             )
         )
 
     return _ok({"status": "broadcasting", "agent_count": len(running_agents)})
+
+
+class SystemMessageRequest(BaseModel):
+    content: str
+
+
+@router.post("/{workspace_id}/system-message")
+async def post_system_message(
+    workspace_id: str,
+    data: SystemMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(_get_current_user_dep()),
+):
+    """Persist a system message (slash command result, etc.) without triggering agent responses."""
+    msg = await msg_service.record_message(
+        db,
+        workspace_id=workspace_id,
+        sender_type="system",
+        sender_id=user.id,
+        sender_name=user.name,
+        content=data.content,
+        message_type="system",
+    )
+    broadcast_event(workspace_id, "system:info", {
+        "id": msg.id,
+        "sender_type": "system",
+        "sender_id": user.id,
+        "sender_name": user.name,
+        "content": data.content,
+        "message_type": "system",
+        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+    })
+    return _ok({"id": msg.id})
 
 
 @router.get("/{workspace_id}/messages")
@@ -402,7 +442,7 @@ def broadcast_event(workspace_id: str, event_type: str, data: dict):
 @router.get("/{workspace_id}/events")
 async def workspace_events(
     workspace_id: str,
-    user=Depends(_get_current_user_dep()),
+    user=Depends(_get_current_user_from_query_dep()),
 ):
     queue: asyncio.Queue = asyncio.Queue()
     if workspace_id not in _workspace_queues:
@@ -487,6 +527,7 @@ async def _stream_agent_response(
     user_name: str,
     user_message: str,
     ws_name: str,
+    mentions: list[str] | None = None,
 ):
     """Stream a single agent's response and relay via SSE broadcast.
 
@@ -503,6 +544,13 @@ async def _stream_agent_response(
         members=members,
         recent_messages=recent_messages,
     )
+
+    if mentions and len(mentions) > 0:
+        is_mentioned = instance_id in mentions
+        if is_mentioned:
+            context_prompt += "\n[重要] 用户在消息中 @提及了你，请务必回复。\n"
+        else:
+            context_prompt += "\n[提示] 用户没有 @提及你。如果消息与你无关，请回复 NO_REPLY。\n"
 
     messages = [
         {"role": "system", "content": context_prompt},
@@ -557,6 +605,10 @@ async def _stream_agent_response(
                         if len(buffer) > NO_REPLY_BUFFER_SIZE:
                             if msg_service.is_no_reply(buffer.strip()):
                                 logger.info("Agent %s replied NO_REPLY, discarding", agent_name)
+                                broadcast_event(workspace_id, "agent:done", {
+                                    "instance_id": instance_id,
+                                    "agent_name": agent_name,
+                                })
                                 return
                             broadcast_event(workspace_id, "agent:chunk", {
                                 "instance_id": instance_id,
@@ -582,6 +634,10 @@ async def _stream_agent_response(
     if not flushed and buffer:
         if msg_service.is_no_reply(buffer.strip()):
             logger.info("Agent %s replied NO_REPLY (short response), discarding", agent_name)
+            broadcast_event(workspace_id, "agent:done", {
+                "instance_id": instance_id,
+                "agent_name": agent_name,
+            })
             return
         broadcast_event(workspace_id, "agent:chunk", {
             "instance_id": instance_id,
@@ -605,3 +661,8 @@ async def _stream_agent_response(
                 sender_name=agent_name,
                 content=full_response,
             )
+    else:
+        broadcast_event(workspace_id, "agent:done", {
+            "instance_id": instance_id,
+            "agent_name": agent_name,
+        })

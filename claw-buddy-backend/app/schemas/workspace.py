@@ -25,9 +25,11 @@ class AgentBrief(BaseModel):
     instance_id: str
     name: str
     display_name: str | None = None
+    slug: str | None = None
     status: str
     hex_q: int
     hex_r: int
+    sse_connected: bool = False
 
 
 class WorkspaceInfo(BaseModel):
@@ -114,6 +116,7 @@ class ChatMessageRequest(BaseModel):
 
 class WorkspaceChatRequest(BaseModel):
     message: str
+    mentions: list[str] | None = None
 
 
 class WorkspaceMessageInfo(BaseModel):

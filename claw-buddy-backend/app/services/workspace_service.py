@@ -1,5 +1,6 @@
 """Workspace CRUD + Agent management + Blackboard service."""
 
+import asyncio
 import logging
 
 from sqlalchemy import func, select
@@ -26,13 +27,16 @@ logger = logging.getLogger(__name__)
 
 
 def _agent_brief(inst: Instance) -> AgentBrief:
+    from app.services.sse_listener import sse_listener_manager
     return AgentBrief(
         instance_id=inst.id,
         name=inst.name,
         display_name=inst.agent_display_name,
+        slug=inst.slug,
         status=inst.status,
         hex_q=inst.hex_position_q,
         hex_r=inst.hex_position_r,
+        sse_connected=inst.id in sse_listener_manager.healthy_instances,
     )
 
 
@@ -187,6 +191,8 @@ async def add_agent(db: AsyncSession, workspace_id: str, data: AddAgentRequest) 
 
     await _deploy_channel_plugin(inst, db, workspace_id)
 
+    asyncio.create_task(_send_welcome_message(workspace_id, inst))
+
     return _agent_brief(inst)
 
 
@@ -270,6 +276,12 @@ async def _deploy_channel_plugin(inst: Instance, db: AsyncSession, workspace_id:
         return
 
     try:
+        from app.services.llm_config_service import deploy_learning_channel_plugin
+        await deploy_learning_channel_plugin(inst, db)
+    except Exception as e:
+        logger.warning("部署 learning plugin 失败（非致命）: instance=%s error=%s", inst.name, e)
+
+    try:
         from app.services.instance_service import restart_instance
         await restart_instance(inst.id, db)
         logger.info("已重启实例以加载 channel plugin: %s", inst.name)
@@ -282,6 +294,7 @@ async def _deploy_channel_plugin(inst: Instance, db: AsyncSession, workspace_id:
             inst.id,
             inst.ingress_domain,
             delay=15,
+            workspace_id=workspace_id,
         )
 
 
@@ -295,6 +308,50 @@ async def _remove_channel_plugin(inst: Instance, db: AsyncSession) -> None:
         await remove_clawbuddy_channel_plugin(inst, db)
     except Exception as e:
         logger.error("移除 channel plugin 失败（非致命）: instance=%s error=%s", inst.name, e)
+
+
+WELCOME_MESSAGE = "你好！你刚刚加入了工作区，请向大家介绍一下你自己：你叫什么名字、你的能力和专长是什么。"
+WELCOME_DELAY_SECONDS = 20
+
+
+async def _send_welcome_message(workspace_id: str, inst: Instance) -> None:
+    """Wait for the instance to be ready, then trigger Agent self-introduction."""
+    agent_name = inst.agent_display_name or inst.name
+
+    await asyncio.sleep(WELCOME_DELAY_SECONDS)
+
+    try:
+        from app.api.workspaces import broadcast_event
+        from app.core.deps import async_session_factory
+        from app.services import workspace_message_service as msg_service
+
+        async with async_session_factory() as db:
+            await msg_service.record_message(
+                db,
+                workspace_id=workspace_id,
+                sender_type="system",
+                sender_id="system",
+                sender_name="System",
+                content=f"{agent_name} 已加入工作区",
+                message_type="system",
+            )
+
+        broadcast_event(workspace_id, "system:welcome", {
+            "agent_name": agent_name,
+            "instance_id": inst.id,
+            "content": f"{agent_name} 已加入工作区",
+        })
+
+        from app.services.collaboration_service import _invoke_target_agent
+        await _invoke_target_agent(
+            workspace_id=workspace_id,
+            target_instance=inst,
+            source_name="System",
+            message=WELCOME_MESSAGE,
+            depth=0,
+        )
+    except Exception as e:
+        logger.warning("发送欢迎消息失败（非致命）: instance=%s error=%s", inst.name, e)
 
 
 # ── Blackboard ───────────────────────────────────────
