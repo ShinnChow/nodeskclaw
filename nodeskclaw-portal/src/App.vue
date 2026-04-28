@@ -4,10 +4,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { getCurrentLocale, setCurrentLocale } from '@/i18n'
-import { Settings, LogOut, Boxes, Server, FlaskConical, User } from 'lucide-vue-next'
+import { Settings, LogOut, Boxes, Server, FlaskConical, User, Loader2, BarChart3 } from 'lucide-vue-next'
+import { useFeature } from '@/composables/useFeature'
 import LocaleSelect from '@/components/shared/LocaleSelect.vue'
 import ToastContainer from '@/components/shared/ToastContainer.vue'
 import ConfirmDialog from '@/components/shared/ConfirmDialog.vue'
+import { useDeployNotification } from '@/composables/useDeployNotification'
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
@@ -19,6 +21,10 @@ const isSetupPage = computed(() => route.path === '/setup-org')
 const showUserMenu = ref(false)
 const userMenuRef = ref<HTMLElement>()
 const locale = ref(getCurrentLocale())
+const appVersion = __APP_VERSION__
+const { isEnabled: isPerformanceEnabled } = useFeature('performance_analytics')
+
+useDeployNotification()
 
 function onDocumentClick(e: MouseEvent) {
   if (showUserMenu.value && userMenuRef.value && !userMenuRef.value.contains(e.target as Node)) {
@@ -65,14 +71,14 @@ function onLocaleChange(value: string) {
     <router-view />
   </template>
 
-  <template v-else>
+  <template v-else-if="authStore.isLoggedIn && authStore.user">
     <div class="min-h-screen flex flex-col">
       <header class="h-14 flex items-center justify-between px-6 border-b border-border bg-card/80 backdrop-blur-sm sticky top-0 z-50">
         <div class="flex items-center gap-6 min-w-0">
           <div class="flex items-center gap-2 shrink-0 cursor-pointer" @click="router.push('/')">
             <img src="/logo.png" alt="DeskClaw" class="w-5 h-5" />
             <span class="font-bold text-base">DeskClaw</span>
-            <span class="px-1.5 py-0.5 text-[10px] font-semibold leading-none rounded bg-primary/15 text-primary">Beta</span>
+            <span class="px-1.5 py-0.5 text-[10px] font-semibold leading-none rounded bg-primary/15 text-primary">{{ appVersion }}</span>
           </div>
           <nav v-if="!isSetupPage" class="flex items-center gap-1 overflow-x-auto min-w-0">
             <button
@@ -106,6 +112,18 @@ function onLocaleChange(value: string) {
               <FlaskConical class="w-4 h-4 inline mr-1.5" />
               <span class="hidden lg:inline">{{ t('common.geneMarket') }}</span>
               <span class="lg:hidden">{{ t('nav.geneMarket') }}</span>
+            </button>
+            <button
+              v-if="isPerformanceEnabled"
+              :class="[
+                'shrink-0 whitespace-nowrap px-3 py-1.5 rounded-md text-sm transition-colors',
+                route.path.startsWith('/agent-performance') ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground hover:text-foreground',
+              ]"
+              @click="router.push('/agent-performance')"
+            >
+              <BarChart3 class="w-4 h-4 inline mr-1.5" />
+              <span class="hidden lg:inline">{{ t('agentPerformance.navTitle') }}</span>
+              <span class="lg:hidden">{{ t('nav.agentPerformance') }}</span>
             </button>
             <button
               v-if="authStore.user?.portal_org_role === 'admin'"
@@ -189,6 +207,16 @@ function onLocaleChange(value: string) {
       <main class="flex-1">
         <router-view />
       </main>
+    </div>
+  </template>
+
+  <template v-else-if="route.meta.requiresAuth === false">
+    <router-view />
+  </template>
+
+  <template v-else>
+    <div class="h-screen flex items-center justify-center">
+      <Loader2 class="w-6 h-6 animate-spin text-muted-foreground" />
     </div>
   </template>
 </template>

@@ -11,7 +11,7 @@ interface InstanceItem {
   name: string
   status: string
   image_version: string
-  ingress_domain: string | null
+  endpoint_url: string | null
   created_at: string
 }
 
@@ -112,8 +112,8 @@ const isEmpty = computed(() => !loading.value && instances.value.length === 0)
             {{ statusLabels[inst.status] || inst.status }}
           </span>
           <a
-            v-if="inst.ingress_domain && inst.status === 'running'"
-            :href="`https://${inst.ingress_domain}`"
+            v-if="inst.endpoint_url && inst.status === 'running'"
+            :href="inst.endpoint_url"
             target="_blank"
             class="text-primary hover:text-primary/80"
             @click.stop

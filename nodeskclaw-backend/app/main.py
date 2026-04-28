@@ -10,6 +10,8 @@ from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.router import admin_router, api_router, webhook_router
 from app.core.config import settings
@@ -19,8 +21,9 @@ from app.core.exceptions import register_exception_handlers
 _LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 
+_app_version = settings.APP_VERSION
 _log_formatter = logging.Formatter(
-    "%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+    f"%(asctime)s %(levelname)-5s [{_app_version}] [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
@@ -37,7 +40,7 @@ class _ColorFormatter(logging.Formatter):
 
     def __init__(self):
         super().__init__(
-            "%(asctime)s %(colored_level)s [%(name)s] %(message)s",
+            f"%(asctime)s %(colored_level)s [{_app_version}] [%(name)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
@@ -77,6 +80,8 @@ class _PoolDisconnectFilter(logging.Filter):
     """CancelledError -> single-line WARNING; GC cleanup -> WARNING; real errors untouched."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if not record.name.startswith("sqlalchemy.pool"):
+            return True
         if record.exc_info and record.exc_info[1]:
             if isinstance(record.exc_info[1], asyncio.CancelledError):
                 record.levelno = logging.WARNING
@@ -94,7 +99,9 @@ class _PoolDisconnectFilter(logging.Filter):
         return True
 
 
-logging.getLogger("sqlalchemy.pool").addFilter(_PoolDisconnectFilter())
+_pool_filter = _PoolDisconnectFilter()
+_console_handler.addFilter(_pool_filter)
+_file_handler.addFilter(_pool_filter)
 
 import warnings  # noqa: E402
 from sqlalchemy.exc import SAWarning  # noqa: E402
@@ -111,6 +118,27 @@ for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
     _uv_logger.propagate = True
 
 
+class _HealthCheckLogFilter(logging.Filter):
+    """Suppress health-check access logs unless configured or response is an error."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if settings.LOG_HEALTH_CHECK:
+            return True
+        msg = record.getMessage()
+        if "/api/v1/health" not in msg:
+            return True
+        try:
+            status_code = record.args[-1]
+            if isinstance(status_code, int) and status_code >= 400:
+                return True
+        except (IndexError, TypeError):
+            return True
+        return False
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthCheckLogFilter())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
@@ -123,10 +151,13 @@ async def lifespan(app: FastAPI):
     from app.core.deps import async_session_factory, engine
     from app.models.cluster import Cluster, ClusterStatus
     from app.services.k8s.client_manager import k8s_manager
-    from app.utils.oauth_providers.feishu import FeishuProvider
-    from app.utils.oauth_providers.registry import register_provider
 
     logger = logging.getLogger(__name__)
+    logger.info("NoDeskClaw %s starting (Python %s)", settings.APP_VERSION, sys.version.split()[0])
+
+    if not settings.LLM_PROXY_URL:
+        logger.fatal("LLM_PROXY_URL 未配置，服务无法启动。LLM Proxy 为必需组件。")
+        sys.exit(1)
 
     # ── EE Model 注册（在 Alembic 迁移之前导入，使其加入 Base.metadata）──
     from app.core.feature_gate import feature_gate as _fg
@@ -141,7 +172,6 @@ async def lifespan(app: FastAPI):
             pass
 
     # ── Startup ──────────────────────────────────────
-    register_provider(FeishuProvider())
 
     # ── 自动创建开发数据库（仅 DATABASE_NAME_SUFFIX 非空时触发）──
     if settings.DATABASE_NAME_SUFFIX:
@@ -217,9 +247,31 @@ async def lifespan(app: FastAPI):
             logger.exception("数据库迁移失败，应用无法启动")
             raise
 
+    # ── Egress 配置迁移：env vars → system_configs（幂等）──
+    from app.models.system_config import SystemConfig
+    from app.services import config_service
+
+    egress_seeds = {
+        "egress_deny_cidrs": os.environ.get("EGRESS_DENY_CIDRS", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"),
+        "egress_allow_ports": os.environ.get("EGRESS_ALLOW_PORTS", "80,443"),
+        "network_policy_ingress_enabled": "true",
+        "network_policy_egress_enabled": "true",
+        "ingress_allow_cidrs": "",
+    }
+    async with async_session_factory() as db:
+        for _eg_key, _eg_value in egress_seeds.items():
+            _eg_row = (await db.execute(
+                select(SystemConfig).where(SystemConfig.key == _eg_key, SystemConfig.deleted_at.is_(None))
+            )).scalar_one_or_none()
+            if _eg_row is None:
+                await config_service.set_config(_eg_key, _eg_value, db)
+                logger.info("网络策略配置种子: %s = %s", _eg_key, _eg_value)
+
     # ── 种子数据（幂等，每次启动执行）──
-    from app.startup.seed import run_seed
+    from app.startup.seed import run_seed, backfill_cluster_org_id, seed_engine_versions
     _seed_credentials = await run_seed(async_session_factory, is_ee=_fg.is_ee)
+    await backfill_cluster_org_id(async_session_factory)
+    await seed_engine_versions(async_session_factory)
 
     # ── gene_slugs → template_items 迁移（幂等）──
     async with async_session_factory() as db:
@@ -318,20 +370,39 @@ async def lifespan(app: FastAPI):
                     "meta_gene_self_improve.json",
                     "meta_gene_innovation.json",
                     "meta_gene_akr_decomposer.json",
+                    "content_topic_editor.json",
+                    "content_writer.json",
+                    "content_reviewer.json",
+                    "content_distributor.json",
                 ]
                 _genome_files = [
                     "genome_self_management.json",
                     "genome_ai_employee_basics.json",
                     "workflow_genome_example.json",
+                    "genome_content_media_studio.json",
                 ]
 
                 _seeded_genes = 0
+                _updated_genes = 0
                 for _fname in _gene_files:
                     _tpl_path = _seed_dir / _fname
                     if not _tpl_path.exists():
                         continue
                     _tpl = _seed_json.loads(_tpl_path.read_text())
                     _slug = _tpl["slug"]
+
+                    _manifest = _tpl.get("manifest", {})
+                    if "scripts" in _manifest and isinstance(_manifest["scripts"], list):
+                        _scripts_dict = {}
+                        _scripts_dir = _seed_dir.parent / "gene_scripts"
+                        for _sname in _manifest["scripts"]:
+                            _spath = _scripts_dir / _sname
+                            if _spath.exists():
+                                _scripts_dict[_sname] = _spath.read_text()
+                            else:
+                                logger.warning("Seed missing script: %s for %s", _sname, _slug)
+                        _manifest["scripts"] = _scripts_dict
+
                     _existing = (await _seed_db.execute(
                         select(_SeedGene).where(_SeedGene.slug == _slug, _seed_not_deleted(_SeedGene))
                     )).scalar_one_or_none()
@@ -344,14 +415,20 @@ async def lifespan(app: FastAPI):
                             tags=_seed_json.dumps(_tpl.get("tags", []), ensure_ascii=False),
                             source="official",
                             version="1.0.0",
-                            manifest=_seed_json.dumps(_tpl.get("manifest", {}), ensure_ascii=False),
+                            manifest=_seed_json.dumps(_manifest, ensure_ascii=False),
                             is_published=True,
                             review_status="approved",
                             source_registry="local",
                         ))
                         _seeded_genes += 1
+                    else:
+                        _new_manifest = _seed_json.dumps(_manifest, ensure_ascii=False)
+                        if _existing.manifest != _new_manifest:
+                            _existing.manifest = _new_manifest
+                            _updated_genes += 1
 
                 _seeded_genomes = 0
+                _updated_genomes = 0
                 for _fname in _genome_files:
                     _tpl_path = _seed_dir / _fname
                     if not _tpl_path.exists():
@@ -371,14 +448,32 @@ async def lifespan(app: FastAPI):
                             is_published=True,
                         ))
                         _seeded_genomes += 1
+                    else:
+                        _new_slugs = _seed_json.dumps(_tpl.get("gene_slugs", []), ensure_ascii=False)
+                        _new_override = _seed_json.dumps(_tpl.get("config_override", {}), ensure_ascii=False)
+                        _new_desc = _tpl.get("description")
+                        if (_existing.gene_slugs != _new_slugs
+                                or _existing.config_override != _new_override
+                                or _existing.description != _new_desc):
+                            _existing.gene_slugs = _new_slugs
+                            _existing.config_override = _new_override
+                            _existing.description = _new_desc
+                            _updated_genomes += 1
 
-                if _seeded_genes or _seeded_genomes:
+                if _seeded_genes or _seeded_genomes or _updated_genes or _updated_genomes:
                     await _seed_db.commit()
-                    logger.info("种子基因导入完成: %d gene + %d genome", _seeded_genes, _seeded_genomes)
+                    logger.info(
+                        "种子基因导入完成: %d 新增 + %d 更新 gene, %d 新增 + %d 更新 genome",
+                        _seeded_genes, _updated_genes, _seeded_genomes, _updated_genomes,
+                    )
                 else:
-                    logger.info("种子基因检查完成，无需导入（均已存在）")
+                    logger.info("种子基因检查完成，无需导入或更新（均已是最新）")
         except Exception as _seed_err:
             logger.warning("种子基因导入失败: %s", _seed_err)
+
+    # ── 默认工作基因 seed（在 Gene 种子导入之后执行）──
+    from app.startup.seed import seed_default_required_genes
+    await seed_default_required_genes(async_session_factory)
 
     # 预热 K8s 连接池：从 DB 加载所有已连接集群
     async with async_session_factory() as db:
@@ -398,6 +493,10 @@ async def lifespan(app: FastAPI):
                 logger.info("预热集群连接: %s (%s)", cluster.name, cluster.id)
             except Exception as e:
                 logger.warning("预热集群 %s 失败: %s", cluster.name, e)
+
+    # ── 补建缺失的 proxy Ingress（按 proxy_endpoint 配置，不限 CE/EE）──
+    from app.startup.proxy_reconcile import reconcile_proxy_ingresses
+    await reconcile_proxy_ingresses(async_session_factory)
 
     # ── 恢复卡在 deploying 状态的实例 ─────────────────
     # 后端重启（如 --reload）会杀死 asyncio.create_task 部署管道，
@@ -520,8 +619,6 @@ async def lifespan(app: FastAPI):
     # ── Runtime Platform v2 Startup ──────────────────
     _pg_notify_service = None
     _heartbeat_task = None
-    _raw_conn = None
-    _asyncpg_conn = None
     _pg_notify_channels: list[str] = []
     _queue_consumer_task = None
     try:
@@ -575,7 +672,10 @@ async def lifespan(app: FastAPI):
                 if ws_id and event_type:
                     queues = _workspace_queues.get(ws_id, set())
                     for q in queues:
-                        q.put_nowait({"event": event_type, "data": data})
+                        try:
+                            q.put_nowait({"event": event_type, "data": data})
+                        except asyncio.QueueFull:
+                            logger.warning("SSE queue full (cross-instance) for workspace %s, dropping %s", ws_id, event_type)
             except Exception as e:
                 logger.warning("_on_sse_push handler failed: %s", e)
 
@@ -586,16 +686,14 @@ async def lifespan(app: FastAPI):
 
         _pg_notify_channels = ["topology_changed", _sse_push_channel, "message_enqueued"]
         try:
-            _raw_conn = await engine.raw_connection()
-            _asyncpg_conn = _raw_conn.connection._connection
-            await _pg_notify_service.start_listening(_asyncpg_conn, _pg_notify_channels)
+            await _pg_notify_service.start_with_reconnect(engine, _pg_notify_channels)
             logger.info(
                 "Runtime v2: PG LISTEN/NOTIFY 已启动 (channels=%s, backend=%s)",
                 _pg_notify_channels, BACKEND_INSTANCE_ID,
             )
         except Exception as e:
             logger.warning("Runtime v2: PG LISTEN/NOTIFY 启动失败（非致命）: %s", e)
-            _raw_conn = None
+
 
         from app.services.runtime.failure_recovery import run_heartbeat_scanner
         _heartbeat_task = asyncio.create_task(run_heartbeat_scanner(async_session_factory))
@@ -705,6 +803,35 @@ async def lifespan(app: FastAPI):
     registry_aggregator.init(_reg_adapters)
     logger.info("RegistryAggregator 已初始化 (adapters=%s)", [a.registry_id for a in _reg_adapters])
 
+    async def _run_startup_plugin_sync():
+        try:
+            from app.services.llm_config_service import startup_plugin_sync
+            async with async_session_factory() as db:
+                await startup_plugin_sync(db)
+        except Exception as e:
+            logger.warning("startup_plugin_sync 失败（非致命）: %s", e)
+
+    asyncio.create_task(_run_startup_plugin_sync())
+
+    # ── 匿名安装遥测（CE-only，一次性上报到 PostHog）──
+    async def _run_telemetry():
+        try:
+            async with async_session_factory() as db:
+                from app.services import telemetry_service
+                await telemetry_service.report_installation_once(db)
+        except Exception as e:
+            logger.warning("遥测上报失败（非致命）: %s", e)
+
+    if _fg.is_ee:
+        logger.info("遥测已跳过 (EE 模式)")
+    elif not settings.TELEMETRY_ENABLED:
+        logger.info("遥测已关闭 (TELEMETRY_ENABLED=false)")
+    elif not settings.POSTHOG_API_KEY:
+        logger.info("遥测已跳过 (POSTHOG_API_KEY 未配置)")
+    else:
+        logger.info("遥测启用，将在后台上报匿名安装信息")
+        _telemetry_task = asyncio.create_task(_run_telemetry())
+
     yield
 
     # ── Security Pipeline 销毁 ────────────────────────
@@ -718,18 +845,18 @@ async def lifespan(app: FastAPI):
 
         if _heartbeat_task and not _heartbeat_task.done():
             _heartbeat_task.cancel()
-        if _pg_notify_service and _raw_conn:
+        if _pg_notify_service:
             try:
-                await _pg_notify_service.stop_listening(_asyncpg_conn, _pg_notify_channels)
+                await _pg_notify_service.shutdown()
             except Exception:
-                pass
+                logger.warning("Failed to stop PG NOTIFY listeners", exc_info=True)
         try:
             async with async_session_factory() as _shutdown_db:
                 from app.services.runtime import sse_registry
                 await sse_registry.cleanup_backend_connections(_shutdown_db)
                 await _shutdown_db.commit()
         except Exception:
-            pass
+            logger.warning("Failed to cleanup SSE backend connections", exc_info=True)
         from app.services.runtime.failure_recovery import shutdown_cleanup
         await shutdown_cleanup(async_session_factory)
         logger.info("Runtime v2: 已清理")
@@ -767,11 +894,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── API Cache-Control ────────────────────────────────
-from starlette.datastructures import MutableHeaders
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
-
-
 class _NoCacheAPIMiddleware:
     """Pure ASGI middleware — no BaseHTTPMiddleware task-group wrapping."""
 
@@ -786,7 +908,11 @@ class _NoCacheAPIMiddleware:
         async def _send(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                if "cache-control" not in headers:
+                ct = headers.get("content-type", "")
+                if "text/event-stream" in ct:
+                    headers["X-Accel-Buffering"] = "no"
+                    headers["Cache-Control"] = "no-cache"
+                elif "cache-control" not in headers:
                     headers.append("Cache-Control", "no-store")
             await send(message)
 
@@ -832,8 +958,9 @@ if feature_gate.is_ee:
             pass
 
         logging.getLogger(__name__).info("EE 模块已加载（含操作审计）")
-    except ImportError:
-        logging.getLogger(__name__).warning("检测到 ee/ 目录但 EE 模块加载失败，以 CE 模式运行")
+    except Exception:
+        logging.getLogger(__name__).exception("EE 模块加载失败，无法以 CE 模式降级运行")
+        raise
 
 if not feature_gate.is_ee:
     from app.services.audit_handler import register_ce_audit_handler

@@ -1,5 +1,7 @@
 """Instance service: list, detail, delete, scale, restart, config save/apply."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -18,6 +20,8 @@ from app.models.deploy_record import DeployAction, DeployRecord, DeployStatus
 from app.models.instance import Instance, InstanceStatus
 from app.schemas.deploy import DeployRecordInfo
 from app.schemas.instance import InstanceDetail, InstanceInfo, UpdateConfigRequest, WorkspaceBrief
+from app.services.runtime.compute.base import ComputeHandle
+from app.utils.display_status import compute_display_status
 from app.services.k8s.client_manager import k8s_manager
 from app.services.k8s.k8s_client import K8sClient
 from app.services.k8s.resource_builder import build_configmap, build_labels
@@ -65,6 +69,16 @@ async def _deferred_pv_cleanup(k8s: K8sClient, namespace: str) -> None:
             )
 
 
+async def _cleanup_backup_s3_objects(keys: list[str]) -> None:
+    """异步清理已软删除的备份在 S3 上的对象。"""
+    from app.services import storage_service
+    for key in keys:
+        try:
+            await storage_service.delete_raw(key)
+        except Exception as e:
+            logger.warning("清理备份 S3 对象失败 (key=%s): %s", key, e)
+
+
 def _sanitize_name(name: str) -> str:
     """将实例名称清洗为 RFC 1123 格式（与 deploy_service 逻辑保持一致）。"""
     safe = _re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
@@ -76,9 +90,7 @@ def _k8s_name(instance: Instance) -> str:
     return instance.slug or instance.name
 
 
-def _build_docker_handle(instance: Instance) -> "ComputeHandle":
-    from app.services.runtime.compute.base import ComputeHandle
-    env_vars = json.loads(instance.env_vars) if instance.env_vars else {}
+def _build_docker_handle(instance: Instance) -> ComputeHandle:
     advanced = json.loads(instance.advanced_config) if instance.advanced_config else {}
     return ComputeHandle(
         provider="docker", instance_id=instance.id,
@@ -104,6 +116,7 @@ async def _in_deploy_grace(instance_id: str, db: AsyncSession, grace_seconds: in
         .where(
             DeployRecord.instance_id == instance_id,
             DeployRecord.status == DeployStatus.success,
+            DeployRecord.deleted_at.is_(None),
         )
         .order_by(DeployRecord.finished_at.desc())
         .limit(1)
@@ -114,7 +127,7 @@ async def _in_deploy_grace(instance_id: str, db: AsyncSession, grace_seconds: in
     return (datetime.now(timezone.utc) - finished_at).total_seconds() < grace_seconds
 
 
-def _compute_endpoint_url(instance: Instance) -> str | None:
+def _compute_endpoint_url(instance: Instance, *, tls_enabled: bool = True) -> str | None:
     from app.services.runtime.registries.runtime_registry import RUNTIME_REGISTRY
     spec = RUNTIME_REGISTRY.get(instance.runtime)
     if spec and not spec.has_web_ui:
@@ -122,7 +135,8 @@ def _compute_endpoint_url(instance: Instance) -> str | None:
     if instance.compute_provider == "docker" and instance.ingress_domain:
         return f"http://{instance.ingress_domain}"
     elif instance.ingress_domain:
-        return f"https://{instance.ingress_domain}"
+        proto = "https" if tls_enabled else "http"
+        return f"{proto}://{instance.ingress_domain}"
     return None
 
 
@@ -174,6 +188,9 @@ async def list_instances(
     cluster_id: str | None = None,
     org_id: str | None = None,
 ) -> list[InstanceInfo]:
+    from app.services.config_service import get_config
+    tls_enabled = (await get_config("ingress_tls_enabled", db)) != "false"
+
     query = (
         select(Instance)
         .where(Instance.deleted_at.is_(None))
@@ -184,8 +201,16 @@ async def list_instances(
     if org_id:
         query = query.where(Instance.org_id == org_id)
     result = await db.execute(query)
+
+    from app.services.tunnel import tunnel_adapter
+    connected = tunnel_adapter.connected_instances
+    health_corrected = False
+
     items: list[InstanceInfo] = []
     for i in result.scalars().all():
+        if i.status == "running" and i.health_status != "healthy" and i.id in connected:
+            i.health_status = "healthy"
+            health_corrected = True
         wa_result = await db.execute(
             select(WorkspaceAgent, Workspace).join(
                 Workspace,
@@ -201,24 +226,35 @@ async def list_instances(
         ]
         info = InstanceInfo.model_validate(i)
         info.workspaces = workspaces
-        info.endpoint_url = _compute_endpoint_url(i)
+        info.endpoint_url = _compute_endpoint_url(i, tls_enabled=tls_enabled)
         items.append(info)
+
+    if health_corrected:
+        try:
+            await db.commit()
+        except Exception:
+            logger.debug("列表 tunnel 健康修正持久化失败（非致命）")
+
     return items
 
 
-async def get_instance(instance_id: str, db: AsyncSession) -> Instance:
-    result = await db.execute(
-        select(Instance).where(Instance.id == instance_id, Instance.deleted_at.is_(None))
-    )
+async def get_instance(instance_id: str, db: AsyncSession, org_id: str | None = None) -> Instance:
+    query = select(Instance).where(Instance.id == instance_id, Instance.deleted_at.is_(None))
+    if org_id is not None:
+        query = query.where(Instance.org_id == org_id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise NotFoundError("实例不存在")
     return instance
 
 
-async def get_instance_detail(instance_id: str, db: AsyncSession) -> InstanceDetail:
+async def get_instance_detail(instance_id: str, db: AsyncSession, org_id: str | None = None) -> InstanceDetail:
     """Get instance info enriched with live K8s pod data."""
-    instance = await get_instance(instance_id, db)
+    from app.services.config_service import get_config
+    tls_enabled = (await get_config("ingress_tls_enabled", db)) != "false"
+
+    instance = await get_instance(instance_id, db, org_id)
 
     wa_result = await db.execute(
         select(WorkspaceAgent, Workspace).join(
@@ -241,7 +277,7 @@ async def get_instance_detail(instance_id: str, db: AsyncSession) -> InstanceDet
     cluster = cluster_result.scalar_one_or_none()
 
     info_base = InstanceInfo.model_validate(instance)
-    info_base.endpoint_url = _compute_endpoint_url(instance)
+    info_base.endpoint_url = _compute_endpoint_url(instance, tls_enabled=tls_enabled)
 
     detail = InstanceDetail(
         **info_base.model_dump(),
@@ -328,25 +364,48 @@ async def get_instance_detail(instance_id: str, db: AsyncSession) -> InstanceDet
 
             if instance.status == InstanceStatus.running:
                 from app.services.tunnel import tunnel_adapter
-                if instance.id in tunnel_adapter.connected_instances:
+                from app.services.runtime.compute.k8s_provider import evaluate_k8s_health
+                tunnel_connected = instance.id in tunnel_adapter.connected_instances
+                probe = evaluate_k8s_health(tunnel_connected, pods)
+                if probe["healthy"] is True:
                     detail.health_status = "healthy"
-                elif pods:
+                elif probe["healthy"] is False:
                     detail.health_status = "unhealthy"
                 else:
                     detail.health_status = "unknown"
         except Exception as e:
             logger.warning("Failed to fetch pods for instance %s: %s", instance_id, e)
 
+    if (
+        not instance.ingress_domain
+        and instance.compute_provider != "docker"
+        and cluster
+        and cluster.is_k8s
+        and cluster.credentials_encrypted
+    ):
+        try:
+            from app.services.runtime.registries.compute_registry import require_k8s_client
+            _heal_k8s = await require_k8s_client(cluster)
+            _ing = await _heal_k8s.get_ingress(instance.namespace, _k8s_name(instance))
+            if _ing.spec and _ing.spec.rules and _ing.spec.rules[0].host:
+                instance.ingress_domain = _ing.spec.rules[0].host
+                await db.commit()
+                detail.ingress_domain = instance.ingress_domain
+                detail.endpoint_url = _compute_endpoint_url(instance, tls_enabled=tls_enabled)
+        except Exception:
+            pass
+
     if instance.status == InstanceStatus.running and detail.health_status != instance.health_status:
         instance.health_status = detail.health_status
         await db.commit()
 
+    detail.display_status = compute_display_status(detail.status, detail.health_status)
     return detail
 
 
-async def delete_instance(instance_id: str, db: AsyncSession, delete_k8s: bool = True):
+async def delete_instance(instance_id: str, db: AsyncSession, delete_k8s: bool = True, org_id: str | None = None):
     """逻辑删除实例：标记 deleted_at，从 K8s 删除整个命名空间（级联删除所有资源）。"""
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     wa_count_result = await db.execute(
         select(func.count()).select_from(WorkspaceAgent).where(
@@ -359,8 +418,6 @@ async def delete_instance(instance_id: str, db: AsyncSession, delete_k8s: bool =
             message="该实例已加入办公室，请先从办公室中移除",
             message_key="errors.instance.still_in_workspace",
         )
-
-    ws_ids = await _get_instance_workspace_ids(db, instance_id)
 
     if delete_k8s:
         if instance.compute_provider == "docker":
@@ -411,11 +468,28 @@ async def delete_instance(instance_id: str, db: AsyncSession, delete_k8s: bool =
         .where(DeployRecord.instance_id == instance.id, DeployRecord.deleted_at.is_(None))
         .values(deleted_at=func.now())
     )
+    # 级联逻辑删除关联的备份记录并异步清理 S3 对象
+    from app.models.backup import InstanceBackup
+    backup_result = await db.execute(
+        select(InstanceBackup.storage_key).where(
+            InstanceBackup.instance_id == instance.id,
+            InstanceBackup.deleted_at.is_(None),
+            InstanceBackup.storage_key.isnot(None),
+        )
+    )
+    s3_keys = [row[0] for row in backup_result.all()]
+    await db.execute(
+        update(InstanceBackup)
+        .where(InstanceBackup.instance_id == instance.id, InstanceBackup.deleted_at.is_(None))
+        .values(deleted_at=func.now())
+    )
     await db.commit()
+    if s3_keys:
+        _fire_task(_cleanup_backup_s3_objects(s3_keys))
 
 
-async def scale_instance(instance_id: str, replicas: int, db: AsyncSession):
-    instance = await get_instance(instance_id, db)
+async def scale_instance(instance_id: str, replicas: int, db: AsyncSession, org_id: str | None = None):
+    instance = await get_instance(instance_id, db, org_id)
 
     if instance.compute_provider == "docker":
         provider = _get_docker_provider()
@@ -440,8 +514,8 @@ async def scale_instance(instance_id: str, replicas: int, db: AsyncSession):
     await db.commit()
 
 
-async def restart_instance(instance_id: str, db: AsyncSession):
-    instance = await get_instance(instance_id, db)
+async def restart_instance(instance_id: str, db: AsyncSession, org_id: str | None = None):
+    instance = await get_instance(instance_id, db, org_id)
 
     if instance.compute_provider == "docker":
         provider = _get_docker_provider()
@@ -526,10 +600,16 @@ async def _monitor_restart(
             )
             if has_ready:
                 async with async_session_factory() as db:
-                    result = await db.execute(select(Instance).where(Instance.id == instance_id))
+                    result = await db.execute(
+                        select(Instance).where(
+                            Instance.id == instance_id,
+                            Instance.deleted_at.is_(None),
+                        )
+                    )
                     inst = result.scalar_one_or_none()
                     if inst and inst.status == InstanceStatus.restarting:
                         inst.status = InstanceStatus.running
+                        inst.health_status = "healthy"
                         await db.commit()
                         logger.info("实例 %s 重启完成，状态已恢复为 running", inst.name)
                         ws_ids = await _get_instance_workspace_ids(db, instance_id)
@@ -544,10 +624,16 @@ async def _monitor_restart(
     logger.warning("重启监控超时 (%ds)，强制恢复状态: instance=%s", _RESTART_TIMEOUT, instance_id)
     try:
         async with async_session_factory() as db:
-            result = await db.execute(select(Instance).where(Instance.id == instance_id))
+            result = await db.execute(
+                select(Instance).where(
+                    Instance.id == instance_id,
+                    Instance.deleted_at.is_(None),
+                )
+            )
             inst = result.scalar_one_or_none()
             if inst and inst.status == InstanceStatus.restarting:
                 inst.status = InstanceStatus.running
+                inst.health_status = "unknown"
                 await db.commit()
                 ws_ids = await _get_instance_workspace_ids(db, instance_id)
                 _broadcast_agent_status(ws_ids, instance_id, "running")
@@ -555,7 +641,8 @@ async def _monitor_restart(
         logger.exception("重启超时后恢复状态失败: instance=%s", instance_id)
 
 
-async def get_deploy_history(instance_id: str, db: AsyncSession) -> list[DeployRecordInfo]:
+async def get_deploy_history(instance_id: str, db: AsyncSession, org_id: str | None = None) -> list[DeployRecordInfo]:
+    await get_instance(instance_id, db, org_id)
     result = await db.execute(
         select(DeployRecord)
         .where(DeployRecord.instance_id == instance_id, DeployRecord.deleted_at.is_(None))
@@ -565,9 +652,14 @@ async def get_deploy_history(instance_id: str, db: AsyncSession) -> list[DeployR
 
 
 async def get_pod_logs(
-    instance_id: str, pod_name: str, db: AsyncSession, container: str | None = None, tail_lines: int = 200
+    instance_id: str,
+    pod_name: str,
+    db: AsyncSession,
+    container: str | None = None,
+    tail_lines: int = 200,
+    org_id: str | None = None,
 ) -> str:
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     if instance.compute_provider == "docker":
         provider = _get_docker_provider()
@@ -591,12 +683,12 @@ async def get_pod_logs(
 # ────────────────────────────────────────────────────────────
 
 async def save_config(
-    instance_id: str, req: UpdateConfigRequest, db: AsyncSession
+    instance_id: str, req: UpdateConfigRequest, db: AsyncSession, org_id: str | None = None
 ) -> InstanceInfo:
     """
     Step 1: 仅保存配置变更到 pending_config，不执行 K8s 操作。
     """
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     pending = {
         "image_version": req.image_version,
@@ -621,12 +713,12 @@ async def save_config(
 
 
 async def apply_config(
-    instance_id: str, user_id: str, db: AsyncSession
+    instance_id: str, user_id: str, db: AsyncSession, org_id: str | None = None
 ) -> InstanceInfo:
     """
     Step 2: 读取 pending_config，执行 K8s 滚动更新，成功后清空 pending_config。
     """
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     if not instance.pending_config:
         raise NotFoundError("没有待应用的配置变更")
@@ -644,10 +736,10 @@ async def apply_config(
 
 
 async def update_config(
-    instance_id: str, req: UpdateConfigRequest, user_id: str, db: AsyncSession
+    instance_id: str, req: UpdateConfigRequest, user_id: str, db: AsyncSession, org_id: str | None = None
 ) -> InstanceInfo:
     """兼容旧接口: 直接保存 + 应用（供回滚等场景使用）。"""
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
     return await _execute_config_update(instance, req, user_id, db)
 
 
@@ -821,12 +913,12 @@ async def _execute_config_update(
     return InstanceInfo.model_validate(instance)
 
 
-async def sync_gateway_token(instance_id: str, db: AsyncSession) -> str:
+async def sync_gateway_token(instance_id: str, db: AsyncSession, org_id: str | None = None) -> str:
     """从运行中的 Pod 读取 GATEWAY_TOKEN 并回填到 DB 和 ConfigMap。"""
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     env_vars = json.loads(instance.env_vars) if instance.env_vars else {}
-    existing_token = env_vars.get("GATEWAY_TOKEN")
+    existing_token = env_vars.get("GATEWAY_TOKEN") or env_vars.get("OPENCLAW_GATEWAY_TOKEN")
     if existing_token:
         normalized_env_vars = _normalize_gateway_env_vars(env_vars, existing_token)
         changed = normalized_env_vars != env_vars or instance.proxy_token != existing_token
@@ -894,9 +986,9 @@ async def sync_gateway_token(instance_id: str, db: AsyncSession) -> str:
     return token
 
 
-async def regenerate_gateway_token(instance_id: str, db: AsyncSession) -> str:
+async def regenerate_gateway_token(instance_id: str, db: AsyncSession, org_id: str | None = None) -> str:
     """生成新的访问令牌，更新配置并触发实例重启。"""
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
     old_env_vars_json = instance.env_vars
     old_env_vars = json.loads(instance.env_vars) if instance.env_vars else {}
     old_proxy_token = instance.proxy_token
@@ -927,18 +1019,18 @@ async def regenerate_gateway_token(instance_id: str, db: AsyncSession) -> str:
         logger.exception("更新实例访问令牌失败: instance=%s", instance_id)
         await db.rollback()
         try:
-            fresh_instance = await get_instance(instance_id, db)
+            fresh_instance = await get_instance(instance_id, db, org_id)
             await _replace_instance_configmap(fresh_instance, old_env_vars, k8s)
         except Exception:
             logger.exception("恢复旧访问令牌 ConfigMap 失败: instance=%s", instance_id)
         raise ConflictError("重设访问令牌失败，请稍后重试") from exc
 
     try:
-        await restart_instance(instance_id, db)
+        await restart_instance(instance_id, db, org_id)
     except Exception as exc:
         logger.exception("访问令牌更新后触发重启失败: instance=%s", instance_id)
         try:
-            rollback_instance = await get_instance(instance_id, db)
+            rollback_instance = await get_instance(instance_id, db, org_id)
             rollback_instance.env_vars = old_env_vars_json
             rollback_instance.proxy_token = old_proxy_token
             await _replace_instance_configmap(rollback_instance, old_env_vars, k8s)
@@ -952,10 +1044,10 @@ async def regenerate_gateway_token(instance_id: str, db: AsyncSession) -> str:
 
 
 async def rollback_instance(
-    instance_id: str, target_revision: int, user_id: str, db: AsyncSession
+    instance_id: str, target_revision: int, user_id: str, db: AsyncSession, org_id: str | None = None
 ) -> InstanceInfo:
     """回滚实例到指定版本。"""
-    instance = await get_instance(instance_id, db)
+    await get_instance(instance_id, db, org_id)
 
     # 查找目标版本记录
     result = await db.execute(
@@ -986,4 +1078,56 @@ async def rollback_instance(
         env_vars=env_vars,
     )
 
-    return await update_config(instance_id, req, user_id, db)
+    return await update_config(instance_id, req, user_id, db, org_id)
+
+
+async def batch_upgrade_image_version(
+    runtime: str, target_version: str, user_id: str, db: AsyncSession,
+    *, dry_run: bool = False,
+) -> dict:
+    """批量将指定 runtime 的所有实例镜像版本对齐到 target_version。"""
+    excluded = [
+        InstanceStatus.creating,
+        InstanceStatus.deploying,
+        InstanceStatus.updating,
+        InstanceStatus.restarting,
+        InstanceStatus.deleting,
+        InstanceStatus.rebuilding,
+        InstanceStatus.restoring,
+    ]
+    result = await db.execute(
+        select(Instance).where(
+            Instance.runtime == runtime,
+            Instance.deleted_at.is_(None),
+            Instance.status.notin_([s.value for s in excluded]),
+        )
+    )
+    instances = list(result.scalars().all())
+
+    upgraded: list[dict] = []
+    skipped: list[dict] = []
+    failed: list[dict] = []
+
+    for instance in instances:
+        brief = {
+            "id": instance.id, "name": instance.name,
+            "slug": instance.slug, "current_version": instance.image_version,
+        }
+        if instance.image_version == target_version:
+            skipped.append(brief)
+            continue
+
+        if dry_run:
+            upgraded.append(brief)
+            continue
+
+        try:
+            await _execute_config_update(
+                instance, UpdateConfigRequest(image_version=target_version), user_id, db,
+            )
+            upgraded.append({**brief, "current_version": target_version})
+        except Exception as e:
+            logger.exception("批量升级实例 %s 失败", instance.name)
+            failed.append({**brief, "error": str(e)[:200]})
+
+    return {"upgraded": upgraded, "skipped": skipped, "failed": failed}

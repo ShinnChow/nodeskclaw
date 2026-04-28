@@ -1,4 +1,4 @@
-"""Auth service: OAuth (generic), email/password, phone/SMS login, JWT management."""
+"""Auth service: email/password, phone/SMS login, JWT management."""
 
 import hashlib
 import hmac
@@ -10,146 +10,19 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.core.exceptions import NotFoundError
 from app.core.security import create_access_token, create_refresh_token, decode_token
 from app.models.user import User, UserRole
 from app.schemas.auth import LoginResponse, TokenResponse, UserInfo
-from app.utils.oauth_providers import get_provider
 
 logger = logging.getLogger(__name__)
 
 _verification_codes: dict[str, tuple[str, float]] = {}
-
-
-async def oauth_login(
-    provider_name: str, code: str, db: AsyncSession,
-    redirect_uri: str | None = None, client_id: str | None = None,
-) -> LoginResponse:
-    """
-    通用 OAuth 登录：
-    1. 通过 provider registry 用 code 换取用户信息
-    2. 按 (provider, provider_user_id) 查 OAuthConnection → 找到 User 或创建新 User
-    3. 按 (provider, provider_tenant_id) 查 OrgOAuthBinding → 自动加入组织或标记 needs_org_setup
-    4. 签发 JWT
-    """
-    from app.models.oauth_connection import UserOAuthConnection
-    from app.models.org_membership import OrgMembership, OrgRole
-    from app.models.org_oauth_binding import OrgOAuthBinding
-
-    provider = get_provider(provider_name)
-    oauth_info = await provider.exchange_code(code, redirect_uri, client_id=client_id)
-
-    conn_result = await db.execute(
-        select(UserOAuthConnection)
-        .where(
-            UserOAuthConnection.provider == oauth_info.provider,
-            UserOAuthConnection.provider_user_id == oauth_info.provider_user_id,
-            UserOAuthConnection.deleted_at.is_(None),
-        )
-    )
-    connection = conn_result.scalar_one_or_none()
-
-    if connection is not None:
-        user_result = await db.execute(
-            select(User)
-            .options(selectinload(User.oauth_connections))
-            .where(User.id == connection.user_id, User.deleted_at.is_(None))
-        )
-        user = user_result.scalar_one_or_none()
-        if user is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={
-                    "error_code": 40106,
-                    "message_key": "errors.auth.user_not_found_or_disabled",
-                    "message": "用户不存在或已禁用",
-                },
-            )
-        user.name = oauth_info.name
-        if oauth_info.email:
-            user.email = oauth_info.email
-        if oauth_info.avatar_url:
-            user.avatar_url = oauth_info.avatar_url
-        if oauth_info.provider_tenant_id:
-            connection.provider_tenant_id = oauth_info.provider_tenant_id
-    else:
-        user = User(
-            name=oauth_info.name,
-            email=oauth_info.email,
-            avatar_url=oauth_info.avatar_url,
-            role=UserRole.user,
-        )
-        db.add(user)
-        await db.flush()
-
-        connection = UserOAuthConnection(
-            user_id=user.id,
-            provider=oauth_info.provider,
-            provider_user_id=oauth_info.provider_user_id,
-            provider_tenant_id=oauth_info.provider_tenant_id,
-        )
-        db.add(connection)
-
-    user.last_login_at = datetime.now(timezone.utc)
-
-    needs_org_setup = False
-    tenant_id = oauth_info.provider_tenant_id
-
-    if tenant_id:
-        binding_result = await db.execute(
-            select(OrgOAuthBinding).where(
-                OrgOAuthBinding.provider == oauth_info.provider,
-                OrgOAuthBinding.provider_tenant_id == tenant_id,
-                OrgOAuthBinding.deleted_at.is_(None),
-            )
-        )
-        binding = binding_result.scalar_one_or_none()
-
-        if binding is not None:
-            await db.flush()
-            existing_membership = await db.execute(
-                select(OrgMembership).where(
-                    OrgMembership.user_id == user.id,
-                    OrgMembership.org_id == binding.org_id,
-                    OrgMembership.deleted_at.is_(None),
-                )
-            )
-            if existing_membership.scalar_one_or_none() is None:
-                db.add(OrgMembership(user_id=user.id, org_id=binding.org_id, role=OrgRole.member))
-            user.current_org_id = binding.org_id
-        else:
-            needs_org_setup = True
-    else:
-        needs_org_setup = True
-
-    await db.commit()
-
-    refreshed = await db.execute(
-        select(User)
-        .options(selectinload(User.oauth_connections))
-        .where(User.id == user.id)
-    )
-    user = refreshed.scalar_one()
-
-    user_info = await _build_user_info(user, db)
-    return LoginResponse(
-        access_token=create_access_token(user.id),
-        refresh_token=create_refresh_token(user.id),
-        user=user_info,
-        needs_org_setup=needs_org_setup,
-        provider=oauth_info.provider,
-    )
-
-
-async def feishu_login(
-    code: str, db: AsyncSession, redirect_uri: str | None = None, client_id: str | None = None,
-) -> LoginResponse:
-    """向后兼容别名。"""
-    return await oauth_login("feishu", code, db, redirect_uri, client_id=client_id)
 
 
 async def refresh_tokens(refresh_token_str: str, db: AsyncSession) -> TokenResponse:
@@ -309,98 +182,26 @@ async def login_with_email(email: str, password: str, db: AsyncSession) -> Login
 
 async def send_sms_code(phone: str) -> dict:
     """发送验证码（当前为 mock，生产环境接真实 SMS 服务）。"""
-    if phone in _verification_codes:
-        _, expire_ts = _verification_codes[phone]
-        remaining = expire_ts - time.time()
-        if remaining > 240:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error_code": 42920,
-                    "message_key": "errors.auth.sms_send_too_frequent",
-                    "message": "发送过于频繁，请稍后再试",
-                },
-            )
-
-    code = f"{secrets.randbelow(900000) + 100000}"
-    _verification_codes[phone] = (code, time.time() + 300)
-
-    # TODO: 接入真实 SMS 服务（阿里云/腾讯云短信）
-    logger.info("SMS 验证码 [%s]: %s (mock)", phone, code)
-
-    return {"sent": True, "message": "验证码已发送"}
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error_code": 50320,
+            "message_key": "errors.auth.sms_not_available",
+            "message": "当前环境未接入短信验证码服务",
+        },
+    )
 
 
 async def login_with_phone(phone: str, code: str, db: AsyncSession) -> LoginResponse:
     """手机号验证码登录（不存在则自动注册）。"""
-    stored = _verification_codes.get(phone)
-    if stored is None:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error_code": 40021,
-                "message_key": "errors.auth.sms_code_not_requested",
-                "message": "请先获取验证码",
-            },
-        )
-
-    stored_code, expire_ts = stored
-    if time.time() > expire_ts:
-        _verification_codes.pop(phone, None)
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error_code": 40022,
-                "message_key": "errors.auth.sms_code_expired",
-                "message": "验证码已过期",
-            },
-        )
-    if stored_code != code:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error_code": 40023,
-                "message_key": "errors.auth.sms_code_invalid",
-                "message": "验证码错误",
-            },
-        )
-
-    _verification_codes.pop(phone, None)
-
-    result = await db.execute(
-        select(User).options(selectinload(User.oauth_connections)).where(User.phone == phone, User.deleted_at.is_(None))
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error_code": 50320,
+            "message_key": "errors.auth.sms_not_available",
+            "message": "当前环境未接入短信验证码服务",
+        },
     )
-    user = result.scalar_one_or_none()
-
-    if user is None:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error_code": 40030,
-                "message_key": "errors.auth.phone_not_registered",
-                "message": "该手机号未注册",
-            },
-        )
-
-    if not user.is_active:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error_code": 40320,
-                "message_key": "errors.auth.account_disabled",
-                "message": "账户已被禁用",
-            },
-        )
-
-    user.last_login_at = datetime.now(timezone.utc)
-    await db.commit()
-
-    refreshed = await db.execute(
-        select(User).options(selectinload(User.oauth_connections)).where(User.id == user.id)
-    )
-    user = refreshed.scalar_one()
-    logger.info("手机登录: %s", phone)
-    return await _issue_tokens(user, db)
 
 
 # ── 修改密码 ─────────────────────────────────────────────
@@ -423,7 +224,7 @@ async def change_password(
     )
     user = result.scalar_one_or_none()
     if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
+        raise NotFoundError("用户不存在", "errors.auth.user_not_found_or_disabled")
 
     if user.password_hash and not user.must_change_password:
         if not old_password:
@@ -652,7 +453,7 @@ async def login_with_verification_code(
             detail={
                 "error_code": 40025,
                 "message_key": "errors.auth.email_not_registered",
-                "message": "该邮箱未注册，请先通过账号密码注册",
+                "message": "该邮箱未注册，请联系管理员获取邀请",
             },
         )
     if not user.is_active:

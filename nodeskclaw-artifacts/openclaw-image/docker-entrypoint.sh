@@ -87,17 +87,39 @@ if [ -f "${CONFIG_FILE}" ]; then
       c.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
       changed = true;
     }
+    const skills = c.skills ?? (c.skills = {});
+    const load = skills.load ?? (skills.load = {});
+    const extraDirs = Array.isArray(load.extraDirs) ? load.extraDirs : [];
+    if (!extraDirs.includes('/root/.openclaw/skills')) {
+      extraDirs.push('/root/.openclaw/skills');
+      load.extraDirs = extraDirs;
+      changed = true;
+    }
+    const tools = c.tools ?? (c.tools = {});
+    const exec = tools.exec ?? (tools.exec = {});
+    if (!exec.security) { exec.security = 'full'; changed = true; }
+    if (!exec.ask) { exec.ask = 'off'; changed = true; }
     if (changed) {
       fs.writeFileSync(f, JSON.stringify(c, null, 2));
-      console.log('[entrypoint] 已补全 controlUi 配置');
+      console.log('[entrypoint] 已补全 controlUi / skills / exec 配置');
     }
   "
+fi
+
+# ---- 1.2. 升级数据修复（兼容旧版目录/文件命名） ----
+
+node /repair-user-data.js
+
+# ---- 1.3. 会话索引修复（兼容旧版会话文件命名） ----
+
+if [ -d "${OPENCLAW_DIR}/agents/main/sessions" ]; then
+  node /repair-sessions-index.js
 fi
 
 # ---- 2. 凭证注入 ----
 
 if [ -n "${OPENCLAW_CREDENTIALS_JSON:-}" ]; then
-  mkdir -p "${CREDENTIALS_DIR}"
+  mkdir -p -m 700 "${CREDENTIALS_DIR}"
   echo "${OPENCLAW_CREDENTIALS_JSON}" > "${CREDENTIALS_DIR}/default.json"
   echo "[entrypoint] 凭证已写入: ${CREDENTIALS_DIR}/default.json"
 fi
@@ -105,6 +127,11 @@ fi
 # ---- 3. 清理编译缓存 ----
 
 rm -rf /tmp/jiti/* 2>/dev/null || true
+
+# ---- 3.5 文件权限收紧 ----
+
+chmod 700 "${OPENCLAW_DIR}" 2>/dev/null || true
+[ -d "${CREDENTIALS_DIR}" ] && chmod 700 "${CREDENTIALS_DIR}"
 
 # ---- 4. 前台启动 ----
 

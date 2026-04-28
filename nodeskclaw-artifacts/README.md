@@ -8,6 +8,7 @@ DeskClaw 部署制品 -- AI 经营伙伴的运行基础设施。包含 DeskClaw 
 nodeskclaw-artifacts/
 ├── common.sh                    # 公共构建函数（OCI 配置、日志、Docker 操作、参数解析）
 ├── build.sh                     # 统一镜像构建入口（./build.sh <engine> --version <ver>）
+├── verify.sh                    # 镜像集成验证脚本（./verify.sh <image:tag>）
 ├── openclaw-image/              # OpenClaw 工作引擎镜像
 │   ├── Dockerfile               # Base 镜像: node:22-bookworm-slim + npm 全局安装 openclaw
 │   ├── Dockerfile.security      # 安全层镜像: FROM base + COPY TypeScript 插件到 extensions/
@@ -15,12 +16,6 @@ nodeskclaw-artifacts/
 │   ├── init-container.sh        # Init Container 脚本（PVC 数据初始化 + 版本升级）
 │   ├── openclaw.json.template   # 配置模板，启动时 envsubst 替换占位符
 │   └── check-update.sh          # 版本检测脚本（查询 npm 最新稳定版、自动更新 Dockerfile）
-├── zeroclaw-image/              # ZeroClaw 高性能工作引擎镜像
-│   ├── Dockerfile               # Base 镜像: debian:bookworm-slim + 预编译二进制下载
-│   ├── Dockerfile.security      # 安全层镜像: 多阶段 Rust 源码构建（git clone + cargo build）
-│   ├── docker-entrypoint.sh     # 容器入口脚本
-│   ├── check-update.sh          # 版本检测脚本（查询 GitHub Releases 最新版、自动更新 Dockerfile）
-│   └── README.md                # 构建说明
 ├── nanobot-image/               # Nanobot 轻量工作引擎镜像
 │   ├── Dockerfile               # Base 镜像: python:3.13-slim-bookworm + pip install nanobot-ai
 │   ├── Dockerfile.security      # 安全层镜像: FROM base + pip install 安全层 + startup wrapper
@@ -69,12 +64,10 @@ cd nodeskclaw-artifacts
 
 # 单引擎（自动检测最新版）
 ./build.sh openclaw
-./build.sh zeroclaw
 ./build.sh nanobot
 
 # 指定版本
 ./build.sh openclaw --version 2026.3.13
-./build.sh zeroclaw --version v0.5.0
 
 # 仅构建不推送
 ./build.sh openclaw --build-only
@@ -96,11 +89,6 @@ cd nodeskclaw-artifacts
 # Nanobot
 ./build.sh nanobot --version 0.1.4 --build-only
 ./build.sh nanobot --with-security --base-tag v0.1.4 --build-only
-
-# ZeroClaw（安全层模式为 Rust 源码构建，耗时较长）
-./build.sh zeroclaw --version v0.5.0 --build-only
-ZEROCLAW_REPO=https://github.com/zeroclaw-labs/zeroclaw.git ZEROCLAW_REF=master \
-  ./build.sh zeroclaw --with-security --base-tag v0.5.0 --build-only
 ```
 
 安全层镜像 Tag 格式: `v{VERSION}-sec`（如 `v2026.2.26-sec`）。
@@ -126,17 +114,16 @@ ZEROCLAW_REPO=https://github.com/zeroclaw-labs/zeroclaw.git ZEROCLAW_REF=master 
 |---------|--------|-------------|
 | OpenClaw | npm `openclaw` | `npm view` 过滤 `YYYY.M.DD` 格式稳定版 |
 | Nanobot | PyPI `nanobot-ai` | PyPI JSON API 过滤 `X.Y.Z` 格式稳定版 |
-| ZeroClaw | GitHub `zeroclaw-labs/zeroclaw` | GitHub Releases API 获取最新 release tag |
 
-发现新版本时自动创建对应 PR，人工审核后合并。三个 runtime 的检测作为独立 Job 并行运行，互不影响。
+发现新版本时自动创建对应 PR，人工审核后合并。
 
 ### 镜像内文件说明
 
 | 文件 | 作用 |
 |------|------|
-| `docker-entrypoint.sh` | 容器启动入口。检查 `OPENCLAW_FORCE_RECONFIG` 决定是否从模板重建配置，补全旧配置缺失的 `controlUi` 字段（版本兼容），注入凭证，然后 `exec openclaw gateway` 前台运行 |
+| `docker-entrypoint.sh` | 容器启动入口。检查 `OPENCLAW_FORCE_RECONFIG` 决定是否从模板重建配置，补全旧配置缺失的 `controlUi` 字段（版本兼容），注入凭证，收紧 `.openclaw` 目录权限至 700，然后 `exec openclaw gateway` 前台运行 |
 | `init-container.sh` | K8s Init Container 执行。首次部署时将 `/root/.openclaw` 模板拷贝到 PVC；版本升级时合并内置插件、更新版本标记 |
-| `openclaw.json.template` | 配置模板，包含 `${OPENCLAW_GATEWAY_PORT}` 等占位符，由 entrypoint 用 `envsubst` 替换生成 `openclaw.json`。`controlUi` 包含 `allowInsecureAuth`（绕过设备配对）和 `dangerouslyAllowHostHeaderOriginFallback`（非 loopback 绑定时的 Origin 校验回退） |
+| `openclaw.json.template` | 配置模板，包含 `${OPENCLAW_GATEWAY_PORT}` 等占位符，由 entrypoint 用 `envsubst` 替换生成 `openclaw.json`。`gateway.auth.rateLimit` 配置暴力破解限流，`controlUi` 包含 `dangerouslyDisableDeviceAuth`（跳过设备配对）和 `dangerouslyAllowHostHeaderOriginFallback`（非 loopback 绑定时的 Origin 校验回退） |
 | `check-update.sh` | 版本检测脚本。查询 npm 最新稳定版（过滤 beta/rc），支持 `--update` 自动更新 Dockerfile |
 
 ### 关键环境变量
@@ -152,9 +139,27 @@ ZEROCLAW_REPO=https://github.com/zeroclaw-labs/zeroclaw.git ZEROCLAW_REF=master 
 | `OPENAI_API_KEY` | OpenAI 模型 Key，DeskClaw 原生读取 | 可选 |
 | `ANTHROPIC_API_KEY` | Anthropic 模型 Key | 可选 |
 
-### 构建产物检查清单
+### 镜像集成验证
 
-构建完成后验证：
+构建完成后使用 `verify.sh` 进行自动化集成验证：
+
+```bash
+cd nodeskclaw-artifacts
+./verify.sh <image:tag>
+```
+
+验证项：
+
+| 检查项 | 说明 |
+|--------|------|
+| 容器启动 | 容器能正常启动并保持 running |
+| 配置兼容性 | `openclaw.json` 可解析，`gateway.auth.token` 存在 |
+| 目录结构 | `/root/.openclaw` 及核心文件存在 |
+| CLI 参数 | `openclaw gateway --help` 包含 `--bind`、`--allow-unconfigured` |
+| 端口监听 | Gateway 18789 可达，SSE 9721 监听 |
+| 版本标记 | `/root/.openclaw-version` 非空 |
+
+手动快速验证：
 
 ```bash
 docker run --rm <image> node --version          # 输出 Node.js 版本

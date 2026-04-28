@@ -7,6 +7,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-nodeskclaw}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nodeskclaw}
       POSTGRES_DB: ${POSTGRES_DB:-nodeskclaw}
+      TZ: ${TZ:-Asia/Shanghai}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nodeskclaw}"]
       interval: 5s
@@ -15,52 +16,83 @@ services:
     restart: unless-stopped
 
   nodeskclaw-backend:
+    image: nodesk-center-cn-beijing.cr.volces.com/public/nodeskclaw-backend:${DESKCLAW_VERSION}
     build:
       context: .
       dockerfile: nodeskclaw-backend/Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        APT_MIRROR: ${APT_MIRROR:-}
     depends_on:
       postgres:
         condition: service_healthy
-        required: false
-    env_file:
-      - path: ./nodeskclaw-backend/.env
-        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - $HOME/.nodeskclaw/docker-instances:$HOME/.nodeskclaw/docker-instances
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: ${NODESKCLAW_DATA_DIR:-${HOME:-.}/.nodeskclaw/docker-instances}
+        target: /nodeskclaw-data
+      - type: bind
+        source: .
+        target: /host-config
+        read_only: true
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://nodeskclaw:nodeskclaw@postgres:5432/nodeskclaw}
       DATABASE_NAME_SUFFIX: ""
       LLM_PROXY_URL: http://llm-proxy:8080
       LLM_PROXY_INTERNAL_URL: http://llm-proxy:8080
       NODESKCLAW_EDITION: ce
-      DOCKER_DATA_DIR: $HOME/.nodeskclaw/docker-instances
+      DOCKER_DATA_DIR: /nodeskclaw-data
+      DOCKER_HOST_DATA_DIR: ${NODESKCLAW_DATA_DIR:-${HOME:-.}/.nodeskclaw/docker-instances}
+      # AI 员工回连后端地址（仅管理 Docker 实例时可保持默认 localhost）
+      # 若管理远端 K8s 集群上的 AI 员工，必须改为 K8s Pod 可达的外部地址
+      AGENT_API_BASE_URL: ${AGENT_API_BASE_URL:-http://localhost:4510/api/v1}
+      DEBUG: ${DEBUG:-true}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-change-me-32-bytes-base64-key__=}
+      INIT_ADMIN_ACCOUNT: ${INIT_ADMIN_ACCOUNT:-admin}
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${BACKEND_PORT:-4510}:8000"
     restart: unless-stopped
 
   llm-proxy:
+    image: nodesk-center-cn-beijing.cr.volces.com/public/nodeskclaw-llm-proxy:${DESKCLAW_VERSION}
     build:
       context: nodeskclaw-llm-proxy
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        APT_MIRROR: ${APT_MIRROR:-}
     depends_on:
       postgres:
         condition: service_healthy
-        required: false
-    env_file:
-      - path: ./nodeskclaw-llm-proxy/.env
-        required: false
+    volumes:
+      - ${CODEX_HOME_DIR:-$HOME/.codex}:/root/.codex
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://nodeskclaw:nodeskclaw@postgres:5432/nodeskclaw}
-      # LLM_LOG_CONTENT: "true"
+      CODEX_HOME: /root/.codex
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${LLM_PROXY_PORT:-4511}:8080"
     restart: unless-stopped
 
   portal:
+    image: nodesk-center-cn-beijing.cr.volces.com/public/nodeskclaw-portal:${DESKCLAW_VERSION}
     build:
       context: nodeskclaw-portal
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-}
     depends_on:
       - nodeskclaw-backend
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${PORTAL_PORT:-80}:80"
     restart: unless-stopped

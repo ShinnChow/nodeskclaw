@@ -126,7 +126,7 @@ class K8sClient:
                     "mem_used": _parse_memory(usage.get("memory", "0")),
                 }
         except Exception:
-            pass  # metrics-server may not be available
+            logger.debug("metrics-server not available, skipping node metrics", exc_info=True)
 
         results = []
         for n in nodes.items:
@@ -217,6 +217,69 @@ class K8sClient:
 
     async def update_deployment_image(self, ns: str, name: str, image: str):
         body = {"spec": {"template": {"spec": {"containers": [{"name": name, "image": image}]}}}}
+        await self.apps.patch_namespaced_deployment(name, ns, body)
+
+    async def set_deployment_env(
+        self, ns: str, name: str, container_name: str, key: str, value: str,
+    ):
+        """Add or update an env var on a Deployment container via strategic merge patch.
+
+        The env list uses `name` as merge key, so existing vars are preserved.
+        Changing the Pod template spec triggers a rolling restart.
+        """
+        body = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": container_name,
+                            "env": [{"name": key, "value": value}],
+                        }]
+                    }
+                }
+            }
+        }
+        await self.apps.patch_namespaced_deployment(name, ns, body)
+
+    async def remove_deployment_env(
+        self, ns: str, name: str, container_name: str, key: str,
+    ):
+        """Remove an env var from a Deployment container (read-modify-write).
+
+        Strategic merge patch cannot delete list items by merge key, so we read
+        the current Deployment, filter out the target env var, and patch back
+        with the complete remaining env list.
+        Changing the Pod template spec triggers a rolling restart.
+        """
+        dep = await self.apps.read_namespaced_deployment(name, ns)
+        target = None
+        for c in dep.spec.template.spec.containers:
+            if c.name == container_name:
+                target = c
+                break
+        if target is None or not target.env:
+            return
+        remaining = [e for e in target.env if e.name != key]
+        env_list = []
+        for e in remaining:
+            entry: dict = {"name": e.name}
+            if e.value is not None:
+                entry["value"] = e.value
+            if e.value_from is not None:
+                entry["valueFrom"] = self._api.sanitize_for_serialization(e.value_from)
+            env_list.append(entry)
+        body = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": container_name,
+                            "env": env_list,
+                        }]
+                    }
+                }
+            }
+        }
         await self.apps.patch_namespaced_deployment(name, ns, body)
 
     # ── Pod ──────────────────────────────────────────

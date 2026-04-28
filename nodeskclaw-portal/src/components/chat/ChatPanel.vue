@@ -10,29 +10,51 @@ import { useWorkspaceStore, type GroupChatMessage, type AgentBrief, type FileAtt
 import FileAttachmentList from './FileAttachmentList.vue'
 import BaseTooltip from '@/components/shared/BaseTooltip.vue'
 import { useAuthStore } from '@/stores/auth'
-import { Send, Loader2, Bot, User, Users, AtSign, Slash, RotateCw, Trash2, Activity, XCircle, Copy, ThumbsUp, ThumbsDown, Paperclip, X, FileText } from 'lucide-vue-next'
+import { Send, Loader2, Bot, User, Users, AtSign, Slash, RotateCw, Trash2, Activity, XCircle, Copy, ThumbsUp, ThumbsDown, Paperclip, X, FileText, Search, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import api from '@/services/api'
 import { resolveApiErrorMessage } from '@/i18n/error'
 import { renderMarkdown as renderMd } from '@/utils/markdown'
+import { copyToClipboard } from '@/utils/clipboard'
 import { AgentMention } from './extensions/agentMention'
 import { SlashCommand } from './extensions/slashCommand'
+import { computeMentionCandidates } from '@/utils/topologyBfs'
+import { formatTime as formatLocaleTime } from '@/utils/localeFormat'
 
 const props = withDefaults(defineProps<{
   workspaceId: string
   canSend?: boolean
+  conversationId?: string
 }>(), {
   canSend: true,
+  conversationId: undefined,
 })
 
-const { t } = useI18n()
+const { t, te, locale } = useI18n()
 const store = useWorkspaceStore()
 const authStore = useAuthStore()
 const toast = useToast()
 
 const messagesEl = ref<HTMLElement | null>(null)
 
-const messages = computed(() => store.chatMessages)
+const messages = computed(() => {
+  if (props.conversationId) {
+    return store.chatMessages.filter(m => m.conversation_id === props.conversationId || !m.conversation_id)
+  }
+  return store.chatMessages
+})
+const chatSearch = ref('')
+const searchFrom = ref('')
+const searchTo = ref('')
+const searchedMessages = ref<GroupChatMessage[]>([])
+const searchLoading = ref(false)
+const searchError = ref('')
+let searchRequestId = 0
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+const normalizedSearch = computed(() => chatSearch.value.trim().toLowerCase())
+const searchActive = computed(() => Boolean(normalizedSearch.value || searchFrom.value || searchTo.value))
+const displayedMessages = computed(() => searchActive.value ? searchedMessages.value : messages.value)
+const searchResultCount = computed(() => displayedMessages.value.length)
 const sending = computed(() => store.chatLoading)
 const typingAgents = computed(() => store.typingAgents)
 const agents = computed(() => store.currentWorkspace?.agents || [])
@@ -88,8 +110,12 @@ function onSlugEnter(e: MouseEvent, msgId: string) {
 async function copySlug(agentId: string) {
   const slug = agentSlug(agentId)
   if (!slug) return
-  await navigator.clipboard.writeText(slug)
-  toast.success(t('chat.slugCopied'))
+  const ok = await copyToClipboard(slug)
+  if (ok) {
+    toast.success(t('chat.slugCopied'))
+  } else {
+    toast.error(t('common.copyFailed'))
+  }
 }
 
 // ── File upload ──────────────────────────────────────
@@ -232,17 +258,26 @@ function insertSystemMessage(content: string, persist = true) {
   scrollToBottom()
 }
 
-function executeSlashCommand(name: string, arg?: string) {
+async function executeSlashCommand(name: string, arg?: string) {
   switch (name) {
     case 'status': {
       const lines = agents.value.map(a => `${agentLabel(a)}: ${a.status}`)
       insertSystemMessage(lines.length ? lines.join('\n') : t('chat.noAgentsInWorkspace'))
       break
     }
-    case 'clear':
-      store.chatMessages.splice(0, store.chatMessages.length)
-      insertSystemMessage(t('chat.chatCleared'), false)
+    case 'clear': {
+      if (!store.hasPermission('manage_settings')) {
+        insertSystemMessage(t('chat.clearNotAllowed'))
+        break
+      }
+      try {
+        await store.clearChatHistory(props.workspaceId)
+        insertSystemMessage(t('chat.chatCleared'), false)
+      } catch (e: any) {
+        insertSystemMessage(t('chat.clearFailed', { error: resolveApiErrorMessage(e, e?.message || '') }))
+      }
       break
+    }
     case 'restart':
       if (arg) doRestartAgent(arg)
       else insertSystemMessage(t('chat.restartUsage'))
@@ -331,7 +366,7 @@ async function sendMessage() {
       const mentionedAgent = mentions.length > 0
         ? agents.value.find(a => a.instance_id === mentions[0])
         : undefined
-      executeSlashCommand(cmdName, mentionedAgent ? agentLabel(mentionedAgent) : undefined)
+      void executeSlashCommand(cmdName, mentionedAgent ? agentLabel(mentionedAgent) : undefined)
     }
     return
   }
@@ -340,7 +375,7 @@ async function sendMessage() {
   if (slashMatch) {
     const cmd = slashMatch[1].toLowerCase()
     const arg = text.slice(slashMatch[0].length).trim().replace(/^@/, '')
-    executeSlashCommand(cmd, arg || undefined)
+    void executeSlashCommand(cmd, arg || undefined)
     return
   }
 
@@ -379,6 +414,7 @@ async function sendMessage() {
     mentions.length > 0 ? mentions : undefined,
     fileIds,
     attachments,
+    props.conversationId,
   )
   scrollToBottom()
 }
@@ -435,7 +471,25 @@ const editor = useEditor({
             status: '',
             slug: '',
           }
+          let candidateSet: Set<string>
+          const conv = props.conversationId
+            ? store.conversations.find(c => c.id === props.conversationId)
+            : undefined
+          const convMembers = conv?.member_node_ids ?? []
+
+          if (props.conversationId && convMembers.length > 0) {
+            candidateSet = new Set(convMembers)
+          } else {
+            const mentionIdsForBfs = new Set<string>()
+            for (const id of existingMentions) {
+              if (id !== '__all__') mentionIdsForBfs.add(id)
+            }
+            candidateSet = new Set(
+              computeMentionCandidates(store.topology, mentionIdsForBfs).map(c => c.agentId),
+            )
+          }
           const agentItems = agents.value
+            .filter(a => candidateSet.has(a.instance_id))
             .filter(a => agentLabel(a).toLowerCase().includes(q))
             .filter(a => !existingMentions.has(a.instance_id))
             .sort((a, b) => hexDistToBlackboard(a.hex_q, a.hex_r) - hexDistToBlackboard(b.hex_q, b.hex_r))
@@ -494,7 +548,9 @@ const editor = useEditor({
         command: ({ editor: ed, range, props: p }: any) => {
           if (p.immediate) {
             ed.chain().focus().deleteRange(range).run()
-            nextTick(() => executeSlashCommand(p.id))
+            nextTick(() => {
+              void executeSlashCommand(p.id)
+            })
             return
           }
           if (p.needsAgent) {
@@ -572,6 +628,70 @@ function parseContent(content: string): Array<{ type: 'text' | 'mention'; value:
   return segments.length ? segments : [{ type: 'text', value: content }]
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function highlightText(value: string): string {
+  if (!normalizedSearch.value || !value) return value
+  const pattern = new RegExp(`(${escapeRegExp(normalizedSearch.value)})`, 'gi')
+  return value.replace(pattern, '<mark class="chat-search-hit">$1</mark>')
+}
+
+function highlightPlainText(value: string): string {
+  return highlightText(escapeHtml(value))
+}
+
+function highlightHtml(html: string): string {
+  if (!normalizedSearch.value || !html) return html
+
+  const template = document.createElement('template')
+  template.innerHTML = html
+  const pattern = new RegExp(escapeRegExp(normalizedSearch.value), 'gi')
+
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || ''
+      if (!text.trim() || !pattern.test(text)) return
+      pattern.lastIndex = 0
+
+      const fragment = document.createDocumentFragment()
+      let lastIndex = 0
+      text.replace(pattern, (match, _group, offset: number) => {
+        if (offset > lastIndex) {
+          fragment.appendChild(document.createTextNode(text.slice(lastIndex, offset)))
+        }
+        const mark = document.createElement('mark')
+        mark.className = 'chat-search-hit'
+        mark.textContent = match
+        fragment.appendChild(mark)
+        lastIndex = offset + match.length
+        return match
+      })
+      if (lastIndex < text.length) {
+        fragment.appendChild(document.createTextNode(text.slice(lastIndex)))
+      }
+      node.parentNode?.replaceChild(fragment, node)
+      pattern.lastIndex = 0
+      return
+    }
+
+    Array.from(node.childNodes).forEach(walk)
+  }
+
+  Array.from(template.content.childNodes).forEach(walk)
+  return template.innerHTML
+}
+
 // ── Markdown rendering ──────────────────────────────
 const GENE_SLUG_RE = /`([a-z][a-z0-9-]*(?:-[a-z0-9]+)*)`/g
 
@@ -584,7 +704,47 @@ function renderMarkdown(content: string): string {
   return html
 }
 
+function renderMarkdownHighlighted(content: string): string {
+  return highlightHtml(renderMarkdown(content))
+}
+
 const feedbackGiven = ref<Record<string, 'up' | 'down'>>({})
+const expandedErrors = ref<Set<string>>(new Set())
+const expandedRawErrors = ref<Set<string>>(new Set())
+
+function toggleErrorDetail(msgId: string) {
+  if (expandedErrors.value.has(msgId)) {
+    expandedErrors.value.delete(msgId)
+  } else {
+    expandedErrors.value.add(msgId)
+  }
+}
+
+function toggleRawError(msgId: string) {
+  if (expandedRawErrors.value.has(msgId)) {
+    expandedRawErrors.value.delete(msgId)
+  } else {
+    expandedRawErrors.value.add(msgId)
+  }
+}
+
+function formatRawError(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+}
+
+function agentErrorText(code: string): string {
+  const key = `errors.agent.${code}`
+  return te(key) ? t(key) : code
+}
+
+const UNHELPFUL_DETAILS = new Set(['empty_response', 'unknown', 'unknown_error'])
+function isHelpfulDetail(detail: string | undefined): detail is string {
+  return !!detail && !UNHELPFUL_DETAILS.has(detail)
+}
 
 async function handleFeedback(msg: GroupChatMessage, type: 'up' | 'down') {
   const key = msg.id
@@ -617,16 +777,100 @@ function scrollToBottom() {
   })
 }
 
-watch(messages, scrollToBottom, { deep: true })
+async function loadDefaultChatHistory() {
+  if (props.conversationId) {
+    const raw = await store.fetchConversationMessages(props.workspaceId, props.conversationId)
+    store.chatMessages = raw
+  } else {
+    const raw = await store.fetchChatHistory(props.workspaceId)
+    store.chatMessages = raw
+  }
+}
 
-onMounted(() => {
-  store.fetchChatHistory(props.workspaceId)
+function toIsoDateTime(value: string): string | undefined {
+  if (!value) return undefined
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return undefined
+  return parsed.toISOString()
+}
+
+async function runSearch() {
+  const currentRequestId = ++searchRequestId
+
+  if (!searchActive.value) {
+    searchError.value = ''
+    searchedMessages.value = []
+    return
+  }
+
+  searchLoading.value = true
+  searchError.value = ''
+  try {
+    const raw = await store.fetchChatHistory(props.workspaceId, {
+      limit: 200,
+      q: chatSearch.value,
+      fromAt: toIsoDateTime(searchFrom.value),
+      toAt: toIsoDateTime(searchTo.value),
+    })
+    if (currentRequestId !== searchRequestId) return
+    searchedMessages.value = raw
+  } catch (e: any) {
+    if (currentRequestId !== searchRequestId) return
+    searchedMessages.value = []
+    searchError.value = resolveApiErrorMessage(e, e?.message || '')
+  } finally {
+    if (currentRequestId === searchRequestId) {
+      searchLoading.value = false
+    }
+  }
+}
+
+function clearSearchFilters() {
+  chatSearch.value = ''
+  searchFrom.value = ''
+  searchTo.value = ''
+}
+
+watch(messages, () => {
+  if (!searchActive.value) scrollToBottom()
+}, { deep: true })
+
+watch(displayedMessages, scrollToBottom, { deep: true })
+
+watch(
+  () => props.workspaceId,
+  async () => {
+    clearSearchFilters()
+    await loadDefaultChatHistory()
+  },
+)
+
+watch(
+  () => props.conversationId,
+  async () => {
+    clearSearchFilters()
+    await loadDefaultChatHistory()
+  },
+)
+
+watch(
+  [chatSearch, searchFrom, searchTo],
+  () => {
+    if (searchTimer) clearTimeout(searchTimer)
+    searchTimer = setTimeout(() => {
+      void runSearch()
+    }, 250)
+  },
+)
+
+onMounted(async () => {
+  await loadDefaultChatHistory()
   store.fetchSystemCapabilities()
 })
 
 function formatTime(dateStr: string): string {
   try {
-    return new Date(dateStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    return formatLocaleTime(dateStr, String(locale.value), { hour: '2-digit', minute: '2-digit' })
   } catch {
     return ''
   }
@@ -643,21 +887,81 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
 
 <template>
   <div class="flex flex-col flex-1 min-h-0">
+    <div class="px-4 py-2 border-b border-border shrink-0 space-y-2">
+      <div class="relative">
+        <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+        <input
+          v-model="chatSearch"
+          class="w-full rounded-lg border border-border bg-muted pl-9 pr-9 py-2 text-sm outline-none focus:ring-1 focus:ring-primary/50"
+          :placeholder="t('chat.searchPlaceholder')"
+        />
+        <button
+          v-if="searchActive"
+          class="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+          :title="t('chat.clearSearch')"
+          @click="clearSearchFilters"
+        >
+          <X class="w-3.5 h-3.5" />
+        </button>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <label class="flex flex-col gap-1 text-xs text-muted-foreground">
+          <span>{{ t('chat.searchFrom') }}</span>
+          <input
+            v-model="searchFrom"
+            type="datetime-local"
+            class="w-full rounded-lg border border-border bg-muted px-3 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary/50"
+            :aria-label="t('chat.searchFrom')"
+          />
+        </label>
+        <label class="flex flex-col gap-1 text-xs text-muted-foreground">
+          <span>{{ t('chat.searchTo') }}</span>
+          <input
+            v-model="searchTo"
+            type="datetime-local"
+            class="w-full rounded-lg border border-border bg-muted px-3 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary/50"
+            :aria-label="t('chat.searchTo')"
+          />
+        </label>
+      </div>
+      <div v-if="searchActive" class="text-xs text-muted-foreground">
+        <template v-if="searchLoading">
+          {{ t('common.loading') }}
+        </template>
+        <template v-else-if="searchError">
+          {{ t('chat.searchFailed', { error: searchError }) }}
+        </template>
+        <template v-else-if="searchResultCount > 0">
+          {{ t('chat.searchResults', { count: searchResultCount }) }}
+        </template>
+        <template v-else>
+          {{ t('chat.searchEmpty') }}
+        </template>
+      </div>
+    </div>
+
     <!-- Messages -->
     <div ref="messagesEl" class="messages-scroll flex-1 px-4 py-3 space-y-3 min-h-0">
       <div
-        v-if="messages.length === 0"
+        v-if="displayedMessages.length === 0 && !searchActive"
         class="flex items-center justify-center h-full text-muted-foreground text-sm"
       >
         {{ t('chat.emptyHint') }}
       </div>
+      <div
+        v-else-if="displayedMessages.length === 0"
+        class="flex items-center justify-center h-full text-muted-foreground text-sm"
+      >
+        {{ searchError || t('chat.searchEmpty') }}
+      </div>
 
-      <div v-for="msg in messages" :key="msg.id">
+      <div v-for="msg in displayedMessages" :key="msg.id">
         <!-- System message -->
         <div v-if="msg.sender_type === 'system'" class="flex justify-center">
-          <span class="text-xs text-muted-foreground bg-muted/50 rounded-lg px-3 py-1 whitespace-pre-wrap">
-            {{ msg.content }}
-          </span>
+          <span
+            class="text-xs text-muted-foreground bg-muted/50 rounded-lg px-3 py-1 whitespace-pre-wrap"
+            v-html="highlightPlainText(msg.content)"
+          />
         </div>
 
         <!-- User / Agent message -->
@@ -710,7 +1014,7 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
                 v-if="msg.message_type === 'collaboration'"
                 class="text-[10px] px-1 py-0.5 rounded bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300 shrink-0"
               >
-                collaboration
+                {{ t('chat.collaborationTag') }}
               </span>
               <span
                 v-if="msg.intent"
@@ -727,12 +1031,55 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
               </span>
             </div>
             <div
-              v-if="msg.sender_type === 'agent'"
+              v-if="msg.sender_type === 'agent' && msg.content"
               class="rounded-lg px-3 py-2 text-sm bg-muted text-foreground chat-markdown"
-              v-html="renderMarkdown(msg.content)"
+              v-html="renderMarkdownHighlighted(msg.content)"
             />
             <div
-              v-if="msg.sender_type === 'agent' && !msg.streaming && msg.content"
+              v-if="msg.sender_type === 'agent' && msg.error"
+              class="rounded-lg border-l-2 border-orange-400 bg-orange-50 dark:bg-orange-950/20 px-3 py-2 text-sm"
+              :class="{ 'mt-1': msg.content }"
+            >
+              <div class="flex items-center gap-1.5 text-orange-700 dark:text-orange-300">
+                <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+                <span>{{ agentErrorText(msg.error.code) }}</span>
+                <button
+                  v-if="msg.error.detail && !isHelpfulDetail(msg.error.detail)"
+                  class="ml-1 flex items-center gap-0.5 text-xs text-orange-500 hover:text-orange-700 dark:hover:text-orange-200 transition-colors"
+                  @click="toggleErrorDetail(msg.id)"
+                >
+                  <component :is="expandedErrors.has(msg.id) ? ChevronDown : ChevronRight" class="w-3 h-3" />
+                  {{ expandedErrors.has(msg.id) ? t('errors.agent.hide_detail') : t('errors.agent.view_detail') }}
+                </button>
+              </div>
+              <div
+                v-if="isHelpfulDetail(msg.error.detail)"
+                class="mt-1 text-xs text-orange-600 dark:text-orange-300/80 break-all"
+              >
+                {{ msg.error.detail }}
+              </div>
+              <div
+                v-else-if="msg.error.detail && expandedErrors.has(msg.id)"
+                class="mt-1.5 rounded bg-orange-100/50 dark:bg-orange-900/20 px-2 py-1 text-xs font-mono text-orange-800 dark:text-orange-200 break-all"
+              >
+                {{ msg.error.detail }}
+              </div>
+              <div v-if="msg.error.raw" class="mt-1.5">
+                <button
+                  class="flex items-center gap-0.5 text-xs text-orange-500 hover:text-orange-700 dark:hover:text-orange-200 transition-colors"
+                  @click="toggleRawError(msg.id)"
+                >
+                  <component :is="expandedRawErrors.has(msg.id) ? ChevronDown : ChevronRight" class="w-3 h-3" />
+                  {{ t('errors.agent.raw_error') }}
+                </button>
+                <pre
+                  v-if="expandedRawErrors.has(msg.id)"
+                  class="mt-1 max-h-[200px] overflow-y-auto rounded bg-orange-100/50 dark:bg-orange-900/20 px-2 py-1.5 text-xs font-mono text-orange-800 dark:text-orange-200 whitespace-pre-wrap break-all"
+                >{{ formatRawError(msg.error.raw) }}</pre>
+              </div>
+            </div>
+            <div
+              v-if="msg.sender_type === 'agent' && !msg.streaming && msg.content && !msg.error"
               class="flex items-center gap-1 mt-1"
             >
               <button
@@ -758,8 +1105,9 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
                 <span
                   v-if="seg.type === 'mention'"
                   class="inline-block rounded px-1 font-semibold text-xs leading-5 bg-white/30 text-primary-foreground"
-                >{{ seg.value }}</span>
-                <span v-else>{{ seg.value }}</span>
+                  v-html="highlightPlainText(seg.value)"
+                />
+                <span v-else v-html="highlightPlainText(seg.value)" />
               </template>
             </div>
             <FileAttachmentList
@@ -793,8 +1141,8 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
             <button
               v-for="(item, idx) in mentionState.items"
               :key="item.id"
-              class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-accent transition-colors text-left"
-              :class="idx === mentionState.selectedIndex ? 'bg-accent' : ''"
+              class="w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors text-left"
+              :class="idx === mentionState.selectedIndex ? 'bg-white/[0.07]' : 'hover:bg-white/[0.04]'"
               @mousedown.prevent="selectSuggestionItem(mentionState!, item)"
               @mouseenter="updateSuggestionIndex(mentionState!, idx)"
             >
@@ -823,8 +1171,8 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
             <button
               v-for="(item, idx) in commandState.items"
               :key="item.id"
-              class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-accent transition-colors text-left"
-              :class="idx === commandState.selectedIndex ? 'bg-accent' : ''"
+              class="w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors text-left"
+              :class="idx === commandState.selectedIndex ? 'bg-white/[0.07]' : 'hover:bg-white/[0.04]'"
               @mousedown.prevent="selectSuggestionItem(commandState!, item)"
               @mouseenter="updateSuggestionIndex(commandState!, idx)"
             >
@@ -962,6 +1310,13 @@ function updateSuggestionIndex(state: SuggestionState, idx: number) {
   pointer-events: none;
   float: left;
   height: 0;
+}
+
+.chat-search-hit {
+  background: rgba(251, 191, 36, 0.3);
+  color: inherit;
+  border-radius: 0.2rem;
+  padding: 0 0.1rem;
 }
 
 .slug-tag {

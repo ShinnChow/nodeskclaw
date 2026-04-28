@@ -3,11 +3,22 @@
 import logging
 import re
 import socket
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _logger = logging.getLogger(__name__)
+
+_K8S_NS_FILE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+
+
+def _detect_platform_namespace() -> str:
+    try:
+        return _K8S_NS_FILE.read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return "nodeskclaw-system"
 
 
 class Settings(BaseSettings):
@@ -15,13 +26,16 @@ class Settings(BaseSettings):
 
     # ── App ──────────────────────────────────────────────
     APP_NAME: str = "NoDeskClaw"
-    APP_VERSION: str = "0.1.0"
+    APP_VERSION: str = "dev"
     DEBUG: bool = False
     LOG_SQL: bool = False
+    LOG_HEALTH_CHECK: bool = False
 
     # ── Database ─────────────────────────────────────────
     DATABASE_URL: str = ""  # PostgreSQL，从 .env 读取
     DATABASE_NAME_SUFFIX: str = ""  # auto = 用本机 hostname，留空 = 使用 DATABASE_URL 原始库名
+    DB_POOL_SIZE: int = 10
+    DB_POOL_MAX_OVERFLOW: int = 20
 
     @model_validator(mode="after")
     def _resolve_database_url(self) -> "Settings":
@@ -80,11 +94,6 @@ class Settings(BaseSettings):
     # ── Encryption (AES-256-GCM for KubeConfig) ─────────
     ENCRYPTION_KEY: str = "change-me-32-bytes-base64-key__="
 
-    # ── 飞书 SSO（Admin 应用） ────────────────────────────
-    FEISHU_APP_ID: str = ""
-    FEISHU_APP_SECRET: str = ""
-    FEISHU_REDIRECT_URI: str = ""
-
     # ── 飞书 SSO（Portal 应用，可选） ─────────────────────
     FEISHU_APP_ID_PORTAL: str = ""
     FEISHU_APP_SECRET_PORTAL: str = ""
@@ -96,12 +105,15 @@ class Settings(BaseSettings):
     VKE_SUBNET_ID: str = ""
 
     # ── LLM Proxy ─────────────────────────────────────────
+    NODESKCLAW_WEBHOOK_BASE_URL: str = ""  # AI 员工回调后端的基础地址，如 http://nodeskclaw-backend:4510
     NODESKCLAW_HOST: str = ""  # 外部可达域名，如 https://nodeskclaw.example.com（废弃，保留兼容）
     LLM_PROXY_URL: str = ""  # 独立 LLM Proxy 服务外部地址，如 https://llm-proxy.example.com
     LLM_PROXY_INTERNAL_URL: str = ""  # K8s 集群内网地址，用于 openclaw.json 中的 baseUrl（绕过 ALB）
 
     # ── Agent API（AI 员工 Pod 回调后端的内网地址）────────
     AGENT_API_BASE_URL: str = "http://localhost:4510/api/v1"
+    GENE_CALLBACK_SECRET: str = ""
+    ALLOW_LEGACY_GENE_CALLBACKS: bool = False
 
     # ── Agent Tunnel（实例通过 WebSocket 主动连接后端的地址）────
     TUNNEL_BASE_URL: str = ""
@@ -109,9 +121,8 @@ class Settings(BaseSettings):
     # ── 出站代理（用于访问 OpenAI/Anthropic 等外部 API）────
     HTTPS_PROXY: str = ""
 
-    # ── Egress NetworkPolicy（AI 员工 Pod 出站流量控制）────
-    EGRESS_DENY_CIDRS: str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-    EGRESS_ALLOW_PORTS: str = "80,443"
+    # ── Platform Namespace（AI 员工 Pod NetworkPolicy 允许访问的后端命名空间）──
+    PLATFORM_NAMESPACE: str = _detect_platform_namespace()
 
     # ── Gene Seed ───────────────────────────────────────
     SEED_GENES: bool = True
@@ -127,16 +138,50 @@ class Settings(BaseSettings):
     GENEHUB_API_KEY: str = ""
     GENEHUB_WEB_URL: str = "https://skills.deskclaw.me"
 
-    # ── TOS 对象存储 ─────────────────────────────────────
-    TOS_ENDPOINT: str = ""
-    TOS_REGION: str = ""
-    TOS_BUCKET: str = ""
-    TOS_ACCESS_KEY_ID: str = ""
-    TOS_SECRET_ACCESS_KEY: str = ""
-    TOS_KEY_PREFIX: str = ""
+    # ── S3 兼容对象存储 ─────────────────────────────────
+    S3_ENDPOINT: str = ""
+    S3_REGION: str = ""
+    S3_BUCKET: str = ""
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    S3_KEY_PREFIX: str = ""
+
+    # ── 本地文件存储（S3 未配置时自动启用）─────────────────
+    LOCAL_STORAGE_DIR: str = ""
+
+    # ── 匿名安装遥测（CE-only）─────────────────────────────
+    TELEMETRY_ENABLED: bool = True
+    POSTHOG_HOST: str = "https://us.i.posthog.com"
+    POSTHOG_API_KEY: str = "phc_qdVoTVCcHEzgwhZVwtPuu6BeoTJPGNQskeUBcXVxnxuF"
 
     # ── CORS ─────────────────────────────────────────────
     CORS_ORIGINS: list[str] = ["http://localhost:4517", "http://localhost:4518"]
 
 
 settings = Settings()
+
+
+def _strip_api_path(base_url: str) -> str:
+    parsed = urlsplit(base_url.rstrip("/"))
+    if not parsed.scheme or not parsed.netloc:
+        return base_url.rstrip("/")
+    path = parsed.path.rstrip("/")
+    for suffix in ("/api/v1", "/api"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+
+
+def get_nodeskclaw_webhook_base_url(cfg: Settings | None = None) -> str:
+    active_settings = cfg or settings
+    candidates = [
+        getattr(active_settings, "NODESKCLAW_WEBHOOK_BASE_URL", ""),
+        getattr(active_settings, "NODESKCLAW_HOST", ""),
+        _strip_api_path(getattr(active_settings, "AGENT_API_BASE_URL", "")),
+    ]
+    for candidate in candidates:
+        normalized = candidate.rstrip("/") if candidate else ""
+        if normalized:
+            return normalized
+    return ""

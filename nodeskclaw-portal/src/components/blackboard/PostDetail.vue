@@ -5,10 +5,11 @@ import { useI18n } from 'vue-i18n'
 import api from '@/services/api'
 import { renderMarkdown } from '@/utils/markdown'
 import MentionPicker from './MentionPicker.vue'
+import { formatDate, formatTime as formatLocaleTime } from '@/utils/localeFormat'
 
 const props = defineProps<{ workspaceId: string; postId: string }>()
 const emit = defineEmits<{ (e: 'back'): void }>()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 interface ReplyItem {
   id: string
@@ -16,6 +17,7 @@ interface ReplyItem {
   author_type: string
   author_id: string
   author_name: string
+  floor_number: number
   created_at: string
 }
 
@@ -84,8 +86,7 @@ function renderMd(raw: string) {
 }
 
 function formatTime(ts: string) {
-  const d = new Date(ts)
-  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return `${formatDate(ts, String(locale.value))} ${formatLocaleTime(ts, String(locale.value), { hour: '2-digit', minute: '2-digit' })}`
 }
 
 onMounted(fetchPost)
@@ -133,7 +134,10 @@ watch(() => props.postId, fetchPost)
           class="pl-3 border-l-2 border-border"
         >
           <div class="flex items-center justify-between text-xs text-muted-foreground mb-1">
-            <span>{{ reply.author_name }}</span>
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="shrink-0 font-medium text-foreground/80">{{ t('blackboard.replyFloor', { number: reply.floor_number }) }}</span>
+              <span class="truncate">{{ reply.author_name }}</span>
+            </div>
             <span>{{ formatTime(reply.created_at) }}</span>
           </div>
           <div class="prose prose-sm prose-invert max-w-none text-sm" v-html="renderMd(reply.content)" />

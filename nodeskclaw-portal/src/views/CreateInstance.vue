@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, ArrowRight, Loader2, Rocket, Database, ChevronDown, RefreshCw, AlertCircle, Check, Brain, Key, Trash2, Plus, Link, Star, X, Cpu, HardDrive } from 'lucide-vue-next'
+import { ArrowLeft, ArrowRight, Loader2, Rocket, Database, ChevronDown, RefreshCw, AlertCircle, Check, Brain, Key, Trash2, Plus, Link, Star, X, Cpu, HardDrive, Zap, CheckCircle, XCircle, Server } from 'lucide-vue-next'
 import ModelSelect from '@/components/shared/ModelSelect.vue'
 import type { ModelItem } from '@/components/shared/ModelSelect.vue'
 import { pinyin } from 'pinyin-pro'
@@ -10,13 +10,21 @@ import { resolveApiErrorMessage } from '@/i18n/error'
 import { useAuthStore } from '@/stores/auth'
 import { useOrgStore } from '@/stores/org'
 import { useI18n } from 'vue-i18n'
+import { useEdition } from '@/composables/useFeature'
 import { getRuntimeCaps } from '@/utils/runtimeCapabilities'
+import { buildDefaultSpecPresets } from '@/utils/instanceFlow'
+import {
+  PROVIDERS, PROVIDER_LABELS, PROVIDER_DEFAULT_URLS,
+  BUILTIN_PROVIDERS, ALL_KNOWN_PROVIDERS,
+  isCodexProvider, DEFAULT_CODEX_MODEL, defaultModelForProvider,
+} from '@/utils/llmProviders'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const orgStore = useOrgStore()
+const { isEE } = useEdition()
 
 const K8S_NAME_MAX = 63
 const NS_PREFIX_BASE = 'nodeskclaw-'.length + 1
@@ -36,6 +44,7 @@ const selectedImage = ref('')
 const storageGi = ref(20)
 const deploying = ref(false)
 const error = ref('')
+const errorKey = ref('')
 const currentStep = ref(1)
 
 // ── Engine selector ──
@@ -46,6 +55,7 @@ interface EngineItem {
   display_tags: string[]
   display_powered_by: string
   order: number
+  available: boolean
 }
 const engines = ref<EngineItem[]>([])
 const selectedRuntime = ref('openclaw')
@@ -72,7 +82,7 @@ const slugTooLong = computed(() => fullSlug.value.length > 0 && (
 const canGoNext = computed(() =>
   !!name.value.trim() && !nameHasEdgeSpaces.value
   && !!slug.value && slugValid.value && !slugConflict.value && !slugChecking.value && !slugTooLong.value
-  && !!selectedImage.value && clusters.value.length > 0
+  && !!selectedImage.value && !!selectedCluster.value
 )
 
 // ── LLM config ──
@@ -85,54 +95,47 @@ interface LlmConfigEntry {
   isCustom: boolean
   showBaseUrl: boolean
   selectedModel: ModelItem | null
-}
-
-const PROVIDERS = ['minimax-openai', 'minimax-anthropic', 'openai', 'anthropic', 'gemini', 'openrouter'] as const
-const PROVIDER_LABELS: Record<string, string> = {
-  openai: 'OpenAI',
-  anthropic: 'Anthropic',
-  gemini: 'Google Gemini',
-  openrouter: 'OpenRouter',
-  'minimax-openai': 'MiniMax-OpenAI (CN)',
-  'minimax-anthropic': 'MiniMax-Anthropic (CN)',
-}
-
-const PROVIDER_DEFAULT_URLS: Record<string, string> = {
-  openai: 'https://api.openai.com/v1',
-  anthropic: 'https://api.anthropic.com',
-  gemini: 'https://generativelanguage.googleapis.com/v1',
-  openrouter: 'https://openrouter.ai/api/v1',
-  'minimax-openai': 'https://api.minimaxi.com/v1',
-  'minimax-anthropic': 'https://api.minimaxi.com/anthropic',
+  skipSslVerify: boolean
 }
 
 const llmConfigs = ref<LlmConfigEntry[]>([])
-const llmSkipped = ref(false)
 const newProvider = ref('')
 const customSlug = ref('')
 const customSlugError = ref('')
 const showCustomForm = ref(false)
-const newProviderOpen = ref(false)
 
 const unusedProviders = computed(() =>
   PROVIDERS.filter(p => !llmConfigs.value.some(c => c.provider === p))
 )
 
-const ALL_KNOWN_PROVIDERS: Set<string> = new Set([...PROVIDERS])
-
 function addProvider(p: string) {
   if (!p) return
+  const orgDetail = orgProviderDetails.value[p]
   llmConfigs.value.push({
     provider: p,
-    keySource: isWorkingPlanAvailable(p) ? 'org' : 'personal',
+    keySource: isCodexProvider(p) ? 'personal' : (isOrgKeyAvailable(p) ? 'org' : 'personal'),
     personalKey: '',
     baseUrl: '',
     apiType: '',
     isCustom: false,
     showBaseUrl: false,
-    selectedModel: null,
+    selectedModel: defaultModelForProvider(p),
+    skipSslVerify: orgDetail?.skip_ssl_verify ?? false,
   })
-  newProviderOpen.value = false
+}
+
+async function loadStorageClasses(clusterId: string) {
+  const scRes = await api.get('/storage-classes', {
+    params: {
+      scope: 'all',
+      cluster_id: clusterId,
+    },
+  })
+  const items = (scRes.data.data ?? []) as StorageClassItem[]
+  storageClasses.value = items
+  const enabled = items.filter(sc => sc.enabled)
+  const def = enabled.find(sc => sc.is_default) ?? enabled[0]
+  selectedStorageClass.value = def?.name ?? null
 }
 
 function addCustomProvider() {
@@ -155,27 +158,56 @@ function addCustomProvider() {
     isCustom: true,
     showBaseUrl: true,
     selectedModel: null,
+    skipSslVerify: false,
   })
   customSlug.value = ''
   customSlugError.value = ''
   showCustomForm.value = false
 }
 
-const BUILTIN_PROVIDERS = new Set(['openai', 'anthropic', 'gemini', 'openrouter'])
-const WORKING_PLAN_PROVIDERS = new Set(['minimax-openai', 'minimax-anthropic'])
-const orgKeyProviders = ref<Set<string>>(new Set())
+function addOrgCustomProvider(orgProvider: any) {
+  llmConfigs.value.push({
+    provider: orgProvider.provider,
+    keySource: 'org',
+    personalKey: '',
+    baseUrl: orgProvider.base_url || '',
+    apiType: orgProvider.api_type || 'openai-completions',
+    isCustom: true,
+    showBaseUrl: true,
+    selectedModel: null,
+    skipSslVerify: orgProvider.skip_ssl_verify ?? false,
+  })
+}
 
-const isWorkingPlanAvailable = (provider: string) =>
-  WORKING_PLAN_PROVIDERS.has(provider) && orgKeyProviders.value.has(provider)
+const orgKeyProviders = ref<Set<string>>(new Set())
+const orgAllowedModels = ref<Record<string, string[] | null>>({})
+const orgProviderDetails = ref<Record<string, any>>({})
+
+const isOrgKeyAvailable = (provider: string) =>
+  orgKeyProviders.value.has(provider)
+
+const orgCustomProviders = computed(() =>
+  Object.values(orgProviderDetails.value)
+    .filter((p: any) => !ALL_KNOWN_PROVIDERS.has(p.provider))
+    .filter((p: any) => !llmConfigs.value.some(c => c.provider === p.provider)),
+)
+
+const orgKeyLabel = computed(() => isEE.value ? 'Working Plan' : t('llm.teamKey'))
 
 async function handleFetchModels(provider: string, callback: (models: ModelItem[], error?: string) => void) {
   const cfg = llmConfigs.value.find(c => c.provider === provider)
-  const params: Record<string, string> = {}
+  const params: Record<string, any> = {}
   if (cfg?.keySource === 'personal' && cfg.personalKey) {
     params.api_key = cfg.personalKey
   }
   if (cfg?.baseUrl) {
     params.base_url = cfg.baseUrl
+  }
+  if (cfg?.apiType) {
+    params.api_type = cfg.apiType
+  }
+  if (cfg?.skipSslVerify) {
+    params.skip_ssl_verify = true
   }
   if (authStore.user?.current_org_id) {
     params.org_id = authStore.user.current_org_id
@@ -183,7 +215,13 @@ async function handleFetchModels(provider: string, callback: (models: ModelItem[
   try {
     const res = await api.get(`/llm/providers/${provider}/models`, { params })
     const msg = res.data?.message ?? ''
-    callback(res.data.data?.models ?? [], msg || undefined)
+    let models: ModelItem[] = res.data.data?.models ?? []
+    const allowed = orgAllowedModels.value[provider]
+    if (allowed && allowed.length > 0) {
+      const allowedSet = new Set(allowed)
+      models = models.filter(m => allowedSet.has(m.id))
+    }
+    callback(models, msg || undefined)
   } catch (e: any) {
     callback([], e?.response?.data?.message ?? t('llm.fetchModelsFailed'))
   }
@@ -191,13 +229,49 @@ async function handleFetchModels(provider: string, callback: (models: ModelItem[
 
 function removeProvider(idx: number) {
   llmConfigs.value.splice(idx, 1)
+  delete testResults.value[idx]
+}
+
+const testingProvider = ref<number | null>(null)
+const testResults = ref<Record<number, { ok: boolean; message: string; tested_model?: string | null; latency_ms?: number | null; error_detail?: string | null }>>({})
+
+async function handleTestKey(idx: number) {
+  const cfg = llmConfigs.value[idx]
+  if (!cfg?.personalKey) return
+  testingProvider.value = idx
+  delete testResults.value[idx]
+  try {
+    const res = await api.post('/llm/test-connection', {
+      provider: cfg.provider,
+      api_key: cfg.personalKey,
+      base_url: cfg.baseUrl || undefined,
+      api_type: cfg.apiType || undefined,
+      skip_ssl_verify: cfg.skipSslVerify,
+      model: cfg.selectedModel?.id || undefined,
+    })
+    testResults.value[idx] = res.data.data
+  } catch (e: any) {
+    testResults.value[idx] = { ok: false, message: resolveApiErrorMessage(e) || t('llm.testKeyFailed') }
+  } finally {
+    testingProvider.value = null
+  }
 }
 
 const storageAnchors = [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
 const storageLabels = [20, 60, 100, 150, 200]
 
-const imageTags = ref<string[]>([])
+interface EngineVersionItem {
+  id: string
+  image_tag: string
+  version: string
+  is_default: boolean
+  release_notes: string | null
+}
+const engineVersions = ref<EngineVersionItem[]>([])
+const imageTags = computed(() => engineVersions.value.map(v => v.image_tag))
 const clusters = ref<{ id: string; name: string; compute_provider: string }[]>([])
+const selectedCluster = ref('')
+const clusterDropdownOpen = ref(false)
 const loadingInit = ref(true)
 const loadingTags = ref(false)
 const imageDropdownOpen = ref(false)
@@ -206,32 +280,40 @@ interface StorageClassItem {
   name: string
   provisioner: string
   is_default: boolean
+  enabled: boolean
 }
 const storageClasses = ref<StorageClassItem[]>([])
 const selectedStorageClass = ref<string | null>(null)
 const scDropdownOpen = ref(false)
+const pvcAccessMode = ref<string>('ReadWriteOnce')
 
-const isK8sCluster = computed(() => {
-  const first = clusters.value[0]
-  return first && first.compute_provider === 'k8s'
-})
-const showStorageClassSelector = computed(() => isK8sCluster.value && storageClasses.value.length > 0)
+const selectedClusterObj = computed(() => clusters.value.find(c => c.id === selectedCluster.value))
+const isK8sCluster = computed(() => selectedClusterObj.value?.compute_provider === 'k8s')
+const enabledStorageClasses = computed(() => storageClasses.value.filter(sc => sc.enabled))
+const showStorageClassSelector = computed(() => isK8sCluster.value)
 
-const specs = [
-  { key: 'small', label: '轻量', desc: '写周报、查资料、日常问答', cpu: '2 核', mem: '4 GB' },
-  { key: 'medium', label: '标准', desc: '代码审查、文档生成、会议纪要', cpu: '4 核', mem: '8 GB' },
-  { key: 'large', label: '高性能', desc: '浏览器自动化、代码开发、数据分析', cpu: '8 核', mem: '16 GB' },
-]
-
-const specResources: Record<string, { cpu_req: string; cpu_lim: string; mem_req: string; mem_lim: string; quota_cpu: string; quota_mem: string; storage: number }> = {
-  small: { cpu_req: '1000m', cpu_lim: '2000m', mem_req: '2Gi', mem_lim: '4Gi', quota_cpu: '2', quota_mem: '4Gi', storage: 20 },
-  medium: { cpu_req: '2000m', cpu_lim: '4000m', mem_req: '4Gi', mem_lim: '8Gi', quota_cpu: '4', quota_mem: '8Gi', storage: 40 },
-  large: { cpu_req: '4000m', cpu_lim: '8000m', mem_req: '8Gi', mem_lim: '16Gi', quota_cpu: '8', quota_mem: '16Gi', storage: 80 },
+interface SpecPreset {
+  key: string
+  label: string
+  desc: string
+  cpu: number
+  memory: number
+  storage: number
+  cpu_request: string
+  cpu_limit: string
+  mem_request: string
+  mem_limit: string
+  quota_cpu: string
+  quota_mem: string
 }
+
+const specPresets = ref<SpecPreset[]>(buildDefaultSpecPresets(t))
+const presetsLoading = ref(true)
 
 function selectSpec(key: string) {
   selectedSpec.value = key
-  storageGi.value = specResources[key]?.storage ?? 40
+  const found = specPresets.value.find(s => s.key === key)
+  storageGi.value = found?.storage ?? 40
 }
 
 const storageIndex = computed({
@@ -247,14 +329,15 @@ const storageIndex = computed({
 async function fetchImageTags() {
   loadingTags.value = true
   try {
-    const res = await api.get('/registry/tags', { params: { runtime: selectedRuntime.value } })
-    const tags = (res.data.data ?? []) as { tag: string }[]
-    imageTags.value = tags.map((t) => t.tag)
-    if (imageTags.value.length > 0 && !selectedImage.value) {
-      selectedImage.value = imageTags.value[0] ?? ''
+    const res = await api.get('/engine-versions', { params: { runtime: selectedRuntime.value } })
+    const versions = (res.data.data ?? []) as EngineVersionItem[]
+    engineVersions.value = versions
+    if (versions.length > 0 && !selectedImage.value) {
+      const defaultVersion = versions.find(v => v.is_default)
+      selectedImage.value = defaultVersion?.image_tag ?? versions[0].image_tag ?? ''
     }
   } catch {
-    imageTags.value = []
+    engineVersions.value = []
   } finally {
     loadingTags.value = false
   }
@@ -309,7 +392,7 @@ function debouncedSlugCheck() {
       const data = res.data.data
       if (data?.conflict) {
         slugConflict.value = true
-        slugError.value = data.reason || '该标识已被占用'
+        slugError.value = data.reason || t('createInstance.slugConflict')
       }
     } catch {
       // ignore
@@ -336,6 +419,16 @@ watch(selectedRuntime, () => {
   fetchImageTags()
 })
 
+watch(selectedCluster, (id) => {
+  const cluster = clusters.value.find(c => c.id === id)
+  if (cluster?.compute_provider === 'k8s') {
+    loadStorageClasses(id).catch(() => {})
+  } else {
+    storageClasses.value = []
+    selectedStorageClass.value = null
+  }
+})
+
 onMounted(async () => {
   try {
     const orgId = authStore.user?.current_org_id
@@ -344,34 +437,45 @@ onMounted(async () => {
       api.get('/engines'),
     ]
     if (orgId) {
-      fetches.push(api.get(`/orgs/${orgId}/available-llm-keys`).catch(() => ({ data: { data: [] } })))
+      fetches.push(api.get(`/orgs/${orgId}/model-providers/available`).catch(() => ({ data: { data: [] } })))
     }
     const [clustersRes, enginesRes, orgKeysRes] = await Promise.all(fetches)
     if (orgKeysRes) {
       const keys = orgKeysRes.data.data ?? []
       orgKeyProviders.value = new Set(keys.map((k: any) => k.provider))
+      for (const k of keys) {
+        orgAllowedModels.value[k.provider] = k.allowed_models ?? null
+        orgProviderDetails.value[k.provider] = k
+      }
     }
     engines.value = (enginesRes.data.data ?? []) as EngineItem[]
     if (engines.value.length > 0 && !engines.value.find(e => e.runtime_id === selectedRuntime.value)) {
       selectedRuntime.value = engines.value[0].runtime_id
     }
     clusters.value = (clustersRes.data.data ?? []).filter((c: any) => c.status === 'connected')
-    if (isK8sCluster.value) {
-      try {
-        const scRes = await api.get('/storage-classes?scope=all')
-        const items = (scRes.data.data ?? []) as StorageClassItem[]
-        storageClasses.value = items
-        const def = items.find(sc => sc.is_default)
-        selectedStorageClass.value = def ? def.name : (items[0]?.name ?? null)
-      } catch {
-        // StorageClass 列表获取失败不阻塞创建流程
-      }
-    }
+    const qCluster = route.query.cluster as string | undefined
+    const matchedCluster = qCluster ? clusters.value.find(c => c.id === qCluster) : null
+    selectedCluster.value = matchedCluster?.id ?? clusters.value[0]?.id ?? ''
     await fetchImageTags()
+
+    try {
+      const presetRes = await api.get('/spec-presets')
+      const items = presetRes.data?.data
+      if (Array.isArray(items) && items.length > 0) {
+        specPresets.value = items
+      }
+    } catch {
+      // API unavailable (old backend / network) — keep defaults
+    } finally {
+      presetsLoading.value = false
+    }
+    selectedSpec.value = specPresets.value[0]?.key ?? 'small'
+    storageGi.value = specPresets.value[0]?.storage ?? 20
   } catch {
     // ignore init errors
   } finally {
     loadingInit.value = false
+    presetsLoading.value = false
   }
 
   const qTemplateId = route.query.template_id as string | undefined
@@ -389,74 +493,116 @@ onMounted(async () => {
 
 const runtimeHasLlm = computed(() => getRuntimeCaps(selectedRuntime.value).llmConfig)
 
-const llmReady = computed(() => {
-  if (!runtimeHasLlm.value) return true
-  if (llmSkipped.value) return true
-  if (llmConfigs.value.length === 0) return false
-  return llmConfigs.value.every(c => {
-    if (c.isCustom) return !!c.baseUrl && !!c.personalKey && !!c.selectedModel
-    if (BUILTIN_PROVIDERS.has(c.provider)) return true
-    return !!c.selectedModel
-  })
-})
+function providerLabel(provider: string) {
+  return PROVIDER_LABELS[provider] || provider
+}
+
+function getLlmDeployBlockReason(): string | null {
+  if (!runtimeHasLlm.value) return null
+  for (const c of llmConfigs.value) {
+    const label = providerLabel(c.provider)
+    if (c.isCustom) {
+      if (!c.baseUrl?.trim()) {
+        return t('createInstance.llmBlockCustomBaseUrl', { label })
+      }
+      if (c.keySource === 'personal' && !c.personalKey?.trim()) {
+        return t('createInstance.llmBlockPersonalKey', { label })
+      }
+      if (!c.selectedModel) {
+        return t('createInstance.llmBlockModel', { label })
+      }
+      continue
+    }
+    if (isCodexProvider(c.provider)) {
+      if (!c.selectedModel) {
+        return t('createInstance.llmBlockModel', { label })
+      }
+      continue
+    }
+    if (c.keySource === 'personal' && !c.personalKey?.trim()) {
+      return t('createInstance.llmBlockPersonalKey', { label })
+    }
+    if (!c.selectedModel) {
+      return t('createInstance.llmBlockModel', { label })
+    }
+  }
+  return null
+}
+
+const llmReady = computed(() => getLlmDeployBlockReason() === null)
 
 const canDeploy = computed(() =>
   !!name.value.trim() && !!slug.value && slugValid.value && !slugConflict.value && !slugChecking.value && !slugTooLong.value
-  && !!selectedImage.value && clusters.value.length > 0 && !deploying.value
-  && llmReady.value
+  && !!selectedImage.value && !!selectedCluster.value && clusters.value.length > 0 && !deploying.value
 )
+
+function validateLlmConfigsBeforeDeploy(): string | null {
+  return getLlmDeployBlockReason()
+}
 
 async function handleDeploy() {
   if (!name.value.trim()) {
-    error.value = '请输入AI 员工名称'
+    error.value = t('createInstance.nameRequired')
     return
   }
   if (!selectedImage.value) {
-    error.value = '请选择镜像版本'
+    error.value = t('createInstance.imageRequired')
     return
   }
-  if (clusters.value.length === 0) {
-    error.value = '没有可用的集群，请联系管理员'
+  if (!selectedCluster.value || clusters.value.length === 0) {
+    error.value = t('createInstance.noClusterError')
+    return
+  }
+  const llmError = validateLlmConfigsBeforeDeploy()
+  if (llmError) {
+    error.value = llmError
     return
   }
 
   deploying.value = true
   error.value = ''
 
-  const res_spec = specResources[selectedSpec.value]
+  const res_spec = specPresets.value.find(s => s.key === selectedSpec.value) ?? specPresets.value[0]
 
   try {
     for (const cfg of llmConfigs.value) {
-      if (cfg.keySource === 'personal' && cfg.personalKey) {
+      if (cfg.keySource === 'personal' && (cfg.personalKey || isCodexProvider(cfg.provider))) {
         await api.post('/users/me/llm-keys', {
           provider: cfg.provider,
-          api_key: cfg.personalKey,
-          base_url: cfg.baseUrl || null,
+          api_key: isCodexProvider(cfg.provider) ? undefined : cfg.personalKey,
+          base_url: isCodexProvider(cfg.provider) ? null : (cfg.baseUrl || null),
           api_type: cfg.isCustom ? cfg.apiType : null,
+          skip_ssl_verify: cfg.skipSslVerify,
         })
       }
     }
 
-    const activeLlm = llmConfigs.value.map(c => ({
-      provider: c.provider,
-      key_source: c.keySource,
-      selected_models: c.selectedModel ? [c.selectedModel] : undefined,
-    }))
+    const activeLlm = llmConfigs.value.map(c => {
+      const selectedModel = c.selectedModel ?? defaultModelForProvider(c.provider)
+      return {
+        provider: c.provider,
+        key_source: c.keySource,
+        selected_models: selectedModel ? [selectedModel] : undefined,
+        base_url: isCodexProvider(c.provider) ? null : (c.baseUrl || null),
+        api_type: c.isCustom ? c.apiType : null,
+      }
+    })
 
     const res = await api.post('/deploy', {
       name: name.value.trim(),
       slug: fullSlug.value,
-      cluster_id: clusters.value[0].id,
+      cluster_id: selectedCluster.value,
       image_version: selectedImage.value,
       replicas: 1,
-      cpu_request: res_spec.cpu_req,
-      cpu_limit: res_spec.cpu_lim,
-      mem_request: res_spec.mem_req,
-      mem_limit: res_spec.mem_lim,
+      cpu_request: res_spec.cpu_request,
+      cpu_limit: res_spec.cpu_limit,
+      mem_request: res_spec.mem_request,
+      mem_limit: res_spec.mem_limit,
       quota_cpu: res_spec.quota_cpu,
       quota_mem: res_spec.quota_mem,
       storage_class: selectedStorageClass.value || undefined,
       storage_size: `${storageGi.value}Gi`,
+      pvc_access_mode: pvcAccessMode.value,
       runtime: selectedRuntime.value,
       description: description.value || undefined,
       llm_configs: activeLlm.length > 0 ? activeLlm : undefined,
@@ -475,7 +621,8 @@ async function handleDeploy() {
       router.push('/instances')
     }
   } catch (e: any) {
-    error.value = resolveApiErrorMessage(e, '部署失败')
+    errorKey.value = e?.response?.data?.message_key || ''
+    error.value = resolveApiErrorMessage(e, t('deployProgress.failedTitle'))
   } finally {
     deploying.value = false
   }
@@ -489,9 +636,30 @@ async function handleDeploy() {
         <ArrowLeft class="w-5 h-5" />
       </button>
       <div>
-        <h1 class="text-xl font-bold">创建AI 员工</h1>
-        <p class="text-sm text-muted-foreground mt-0.5">只需几步即可部署你的 AI 员工</p>
+        <h1 class="text-xl font-bold">{{ t('createInstance.pageTitle') }}</h1>
+        <p class="text-sm text-muted-foreground mt-0.5">{{ t('createInstance.pageSubtitle') }}</p>
       </div>
+    </div>
+
+    <!-- 无集群警告 -->
+    <div
+      v-if="!loadingInit && clusters.length === 0"
+      class="flex items-center gap-3 p-4 rounded-lg border border-amber-500/30 bg-amber-500/5 mb-6"
+    >
+      <AlertCircle class="w-5 h-5 text-amber-500 shrink-0" />
+      <div class="flex-1 text-sm">
+        <span class="font-medium">{{ t('createInstance.noClusterTitle') }}</span>
+        <span class="text-muted-foreground ml-1">
+          {{ isEE ? t('createInstance.noClusterDescEE') : t('createInstance.noClusterDesc') }}
+        </span>
+      </div>
+      <button
+        v-if="!isEE"
+        class="shrink-0 px-3 py-1.5 rounded-md bg-amber-500/10 text-amber-500 text-xs font-medium hover:bg-amber-500/20 transition-colors"
+        @click="router.push('/org-settings/clusters')"
+      >
+        {{ t('createInstance.goSetupCluster') }}
+      </button>
     </div>
 
     <!-- 步骤指示器 -->
@@ -505,7 +673,7 @@ async function handleDeploy() {
           class="w-6 h-6 rounded-full text-xs flex items-center justify-center font-medium transition-colors"
           :class="currentStep >= 1 ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'"
         >1</span>
-        基本信息
+        {{ t('createInstance.stepBasicInfo') }}
       </button>
       <template v-if="runtimeHasLlm">
         <div class="flex-1 h-px" :class="currentStep >= 2 ? 'bg-primary' : 'bg-border'" />
@@ -519,7 +687,7 @@ async function handleDeploy() {
             class="w-6 h-6 rounded-full text-xs flex items-center justify-center font-medium transition-colors"
             :class="currentStep >= 2 ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'"
           >2</span>
-          大模型配置
+          {{ t('createInstance.stepLlmConfig') }}
         </button>
       </template>
     </div>
@@ -538,32 +706,32 @@ async function handleDeploy() {
 
         <!-- 名称 -->
         <div class="space-y-2">
-          <label class="text-sm font-medium">给你的 AI 员工取个名字</label>
+          <label class="text-sm font-medium">{{ t('createInstance.nameLabel') }}</label>
           <input
             v-model="name"
             type="text"
-            placeholder="例如：我的AI助手"
+            :placeholder="t('createInstance.namePlaceholder')"
             class="w-full px-4 py-2.5 rounded-lg bg-card border text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
             :class="nameHasEdgeSpaces ? 'border-destructive' : 'border-border'"
           />
           <p v-if="nameHasEdgeSpaces" class="text-xs text-destructive flex items-center gap-1">
             <AlertCircle class="w-3 h-3" />
-            名称开头和结尾不能包含空格
+            {{ t('createInstance.nameTrimError') }}
           </p>
         </div>
 
         <!-- AI 员工标识 (slug) -->
         <div class="space-y-2">
           <div class="flex items-center gap-2">
-            <label class="text-sm font-medium">AI 员工标识</label>
-            <span v-if="slug && !slugManuallyEdited" class="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">自动生成</span>
+            <label class="text-sm font-medium">{{ t('createInstance.slugLabel') }}</label>
+            <span v-if="slug && !slugManuallyEdited" class="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">{{ t('createInstance.slugAutoGenerated') }}</span>
           </div>
           <div class="flex items-center gap-0">
             <div class="flex-1">
               <input
                 v-model="slug"
                 type="text"
-                placeholder="例如：my-assistant"
+                :placeholder="t('createInstance.slugPlaceholder')"
                 class="w-full px-4 py-2.5 rounded-l-lg bg-card border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
                 :class="slugError ? 'border-destructive' : slug && slugValid && !slugConflict ? 'border-green-500' : 'border-border'"
                 @input="slugManuallyEdited = true"
@@ -581,15 +749,48 @@ async function handleDeploy() {
           </p>
           <p v-else-if="slug && !slugValid" class="text-xs text-destructive flex items-center gap-1">
             <AlertCircle class="w-3 h-3" />
-            须以小写字母开头，仅含小写字母、数字和连字符，至少 2 个字符
+            {{ t('createInstance.slugRule') }}
           </p>
           <p v-else-if="slugTooLong" class="text-xs text-destructive flex items-center gap-1">
             <AlertCircle class="w-3 h-3" />
             {{ t('validation.instance.slug_too_long') }}
           </p>
           <p v-else class="text-xs text-muted-foreground">
-            根据名称自动生成，也可手动修改
+            {{ t('createInstance.slugHint') }}
           </p>
+        </div>
+
+        <!-- 目标集群选择（多集群时显示） -->
+        <div v-if="clusters.length > 1" class="space-y-2">
+          <div class="flex items-center gap-2">
+            <Server class="w-4 h-4 text-emerald-400" />
+            <label class="text-sm font-medium">{{ t('createInstance.clusterLabel') }}</label>
+          </div>
+          <p class="text-xs text-muted-foreground">{{ t('createInstance.clusterHint') }}</p>
+          <div class="relative">
+            <button
+              class="w-full flex items-center justify-between px-4 py-2.5 rounded-lg bg-card border border-border text-sm hover:border-primary/50 transition-colors text-left"
+              @click="clusterDropdownOpen = !clusterDropdownOpen"
+            >
+              <span>{{ selectedClusterObj?.name || t('createInstance.clusterLabel') }}</span>
+              <ChevronDown class="w-4 h-4 text-muted-foreground transition-transform" :class="clusterDropdownOpen ? 'rotate-180' : ''" />
+            </button>
+            <div
+              v-if="clusterDropdownOpen"
+              class="absolute z-10 mt-1 w-full max-h-48 overflow-y-auto rounded-lg border border-border bg-popover shadow-lg"
+            >
+              <button
+                v-for="c in clusters"
+                :key="c.id"
+                class="w-full px-4 py-2.5 text-left text-sm hover:bg-accent transition-colors flex items-center justify-between"
+                :class="c.id === selectedCluster ? 'text-primary bg-primary/5' : 'text-foreground'"
+                @click="selectedCluster = c.id; clusterDropdownOpen = false"
+              >
+                <span>{{ c.name }}</span>
+                <Check v-if="c.id === selectedCluster" class="w-4 h-4 text-primary shrink-0" />
+              </button>
+            </div>
+          </div>
         </div>
 
         <!-- 工作引擎选择 -->
@@ -622,6 +823,10 @@ async function handleDeploy() {
                   :key="tag"
                   class="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary"
                 >{{ tag }}</span>
+                <span
+                  v-if="!eng.available"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground"
+                >{{ t('engine.comingSoon') }}</span>
               </div>
               <div class="text-xs text-muted-foreground mt-1.5 leading-relaxed">{{ eng.display_description }}</div>
               <div class="text-[10px] text-muted-foreground/60 mt-2">{{ t('engine.poweredBy') }} {{ eng.display_powered_by }}</div>
@@ -651,31 +856,25 @@ async function handleDeploy() {
                     class="absolute z-10 mt-1 w-full max-h-48 overflow-y-auto rounded-lg border border-border bg-card shadow-lg"
                   >
                     <button
-                      v-for="tag in imageTags"
-                      :key="tag"
+                      v-for="ev in engineVersions"
+                      :key="ev.id"
                       class="w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-accent transition-colors"
-                      :class="tag === selectedImage ? 'text-primary bg-primary/5' : 'text-foreground'"
-                      @click="selectImage(tag)"
+                      :class="ev.image_tag === selectedImage ? 'text-primary bg-primary/5' : 'text-foreground'"
+                      @click="selectImage(ev.image_tag)"
                     >
-                      {{ tag }}
-                      <span v-if="tag === imageTags[0]" class="ml-2 text-[10px] font-sans text-muted-foreground">({{ t('engine.latestTag') }})</span>
+                      {{ ev.image_tag }}
+                      <span v-if="ev.is_default" class="ml-2 text-[10px] font-sans text-muted-foreground">({{ t('engine.defaultTag') }})</span>
                     </button>
                   </div>
                 </div>
                 <div v-else>
-                  <input
-                    v-model="selectedImage"
-                    type="text"
-                    :placeholder="loadingTags ? t('engine.manualInputLoading') : t('engine.manualInputPlaceholder')"
-                    class="w-full px-3 py-2 rounded-lg bg-card border border-border text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-colors"
-                  />
-                  <p class="text-[10px] text-muted-foreground mt-1">
-                    {{ t('engine.noTagsHint') }}
+                  <p class="text-xs text-muted-foreground py-2">
+                    {{ t('engine.noVersionsPublished') }}
                     <button
                       v-if="authStore.systemInfo?.edition !== 'ee'"
                       class="text-primary hover:underline ml-1"
-                      @click="router.push({ name: 'OrgSettingsRegistry' })"
-                    >{{ t('engine.goToRegistrySettings') }}</button>
+                      @click="router.push({ name: 'OrgSettingsEngineVersions' })"
+                    >{{ t('engine.goToVersionSettings') }}</button>
                   </p>
                 </div>
               </div>
@@ -685,10 +884,10 @@ async function handleDeploy() {
 
         <!-- 规格选择 -->
         <div class="space-y-3">
-          <label class="text-sm font-medium">选择规格</label>
+          <label class="text-sm font-medium">{{ t('createInstance.specLabel') }}</label>
           <div class="grid grid-cols-3 gap-3">
             <button
-              v-for="spec in specs"
+              v-for="spec in specPresets"
               :key="spec.key"
               :class="[
                 'p-4 rounded-xl border text-left transition-all',
@@ -701,8 +900,8 @@ async function handleDeploy() {
               <div class="font-medium text-sm">{{ spec.label }}</div>
               <div class="text-xs text-muted-foreground mt-0.5">{{ spec.desc }}</div>
               <div class="flex gap-3 mt-2 text-xs text-muted-foreground">
-                <span>{{ spec.cpu }}</span>
-                <span>{{ spec.mem }}</span>
+                <span>{{ spec.cpu }} {{ t('orgSettings.specsCpuUnit') }}</span>
+                <span>{{ spec.memory }} GB</span>
               </div>
             </button>
           </div>
@@ -713,41 +912,83 @@ async function handleDeploy() {
           <div class="flex items-center justify-between">
             <label class="text-sm font-medium flex items-center gap-1.5">
               <Database class="w-4 h-4 text-orange-400" />
-              存储空间
+              {{ t('createInstance.storageLabel') }}
             </label>
-            <span class="text-sm text-muted-foreground">当前：<span class="font-medium text-foreground">{{ storageGi }}Gi</span></span>
+            <span class="text-sm text-muted-foreground">{{ t('createInstance.storageCurrent') }}<span class="font-medium text-foreground">{{ storageGi }}Gi</span></span>
           </div>
 
-          <!-- StorageClass 选择器（仅 K8s 集群且有可用 SC 时显示） -->
-          <div v-if="showStorageClassSelector" class="relative">
+          <!-- StorageClass 选择器（K8s 集群始终显示） -->
+          <div v-if="showStorageClassSelector" class="space-y-1.5">
+            <div v-if="storageClasses.length === 0" class="flex items-start gap-1.5 text-xs text-amber-500">
+              <AlertCircle class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span>{{ t('engine.storageClassNone') }}</span>
+            </div>
+            <template v-else>
+              <div v-if="enabledStorageClasses.length === 0" class="flex items-start gap-1.5 text-xs text-amber-500">
+                <AlertCircle class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>{{ t('engine.storageClassNoneEnabled') }}</span>
+              </div>
+              <div class="relative">
+                <div class="flex items-center gap-2">
+                  <HardDrive class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                  <span class="text-xs text-muted-foreground">{{ t('engine.storageClass') }}:</span>
+                  <button
+                    class="flex items-center gap-1 px-2 py-1 rounded-md border border-border bg-card text-xs font-mono hover:border-primary/40 transition-colors"
+                    @click.stop="scDropdownOpen = !scDropdownOpen"
+                  >
+                    <span :class="selectedStorageClass ? '' : 'text-muted-foreground'">{{ selectedStorageClass || t('engine.storageClassPlaceholder') }}</span>
+                    <span v-if="storageClasses.find(sc => sc.name === selectedStorageClass)?.is_default" class="text-muted-foreground">{{ t('engine.storageClassDefault') }}</span>
+                    <ChevronDown class="w-3 h-3 text-muted-foreground" />
+                  </button>
+                </div>
+                <div
+                  v-if="scDropdownOpen"
+                  class="absolute left-0 top-full mt-1 z-20 w-72 max-h-48 overflow-y-auto rounded-lg border border-border bg-popover shadow-lg"
+                >
+                  <button
+                    v-for="sc in storageClasses"
+                    :key="sc.name"
+                    class="w-full text-left px-3 py-2 text-xs transition-colors flex items-center justify-between"
+                    :class="[
+                      sc.name === selectedStorageClass ? 'bg-accent/50' : '',
+                      sc.enabled ? 'hover:bg-accent' : 'opacity-50 cursor-not-allowed',
+                    ]"
+                    :disabled="!sc.enabled"
+                    @click="sc.enabled && (selectedStorageClass = sc.name, scDropdownOpen = false)"
+                  >
+                    <span class="flex flex-col">
+                      <span class="font-mono">{{ sc.name }}<span v-if="sc.is_default" class="ml-1 text-muted-foreground">{{ t('engine.storageClassDefault') }}</span></span>
+                      <span class="text-muted-foreground text-[10px]">{{ sc.provisioner }}</span>
+                    </span>
+                    <Check v-if="sc.name === selectedStorageClass" class="w-3.5 h-3.5 text-primary shrink-0" />
+                    <span v-else-if="!sc.enabled" class="text-[10px] text-muted-foreground">{{ t('engine.storageClassDisabled') }}</span>
+                  </button>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- PVC Access Mode 选择器（K8s 集群显示） -->
+          <div v-if="showStorageClassSelector" class="space-y-1.5">
             <div class="flex items-center gap-2">
               <HardDrive class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-              <span class="text-xs text-muted-foreground">StorageClass:</span>
-              <button
-                class="flex items-center gap-1 px-2 py-1 rounded-md border border-border bg-card text-xs font-mono hover:border-primary/40 transition-colors"
-                @click.stop="scDropdownOpen = !scDropdownOpen"
-              >
-                <span>{{ selectedStorageClass }}</span>
-                <span v-if="storageClasses.find(sc => sc.name === selectedStorageClass)?.is_default" class="text-muted-foreground">{{ t('engine.storageClassDefault') }}</span>
-                <ChevronDown class="w-3 h-3 text-muted-foreground" />
-              </button>
+              <span class="text-xs text-muted-foreground">{{ t('engine.pvcAccessMode') }}:</span>
             </div>
-            <div
-              v-if="scDropdownOpen"
-              class="absolute left-0 top-full mt-1 z-20 w-72 max-h-48 overflow-y-auto rounded-lg border border-border bg-popover shadow-lg"
-            >
+            <div class="flex gap-2">
               <button
-                v-for="sc in storageClasses"
-                :key="sc.name"
-                class="w-full text-left px-3 py-2 text-xs hover:bg-accent transition-colors flex items-center justify-between"
-                :class="sc.name === selectedStorageClass ? 'bg-accent/50' : ''"
-                @click="selectedStorageClass = sc.name; scDropdownOpen = false"
+                v-for="mode in ([
+                  { value: 'ReadWriteOnce', label: t('engine.pvcAccessModeRWO'), desc: t('engine.pvcAccessModeRWODesc') },
+                  { value: 'ReadWriteMany', label: t('engine.pvcAccessModeRWX'), desc: t('engine.pvcAccessModeRWXDesc') },
+                ] as const)"
+                :key="mode.value"
+                class="flex-1 px-3 py-2 rounded-lg border text-left text-xs transition-colors"
+                :class="pvcAccessMode === mode.value
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border bg-card hover:border-primary/40'"
+                @click="pvcAccessMode = mode.value"
               >
-                <span class="flex flex-col">
-                  <span class="font-mono">{{ sc.name }}<span v-if="sc.is_default" class="ml-1 text-muted-foreground">{{ t('engine.storageClassDefault') }}</span></span>
-                  <span class="text-muted-foreground text-[10px]">{{ sc.provisioner }}</span>
-                </span>
-                <Check v-if="sc.name === selectedStorageClass" class="w-3.5 h-3.5 text-primary shrink-0" />
+                <span class="font-medium" :class="pvcAccessMode === mode.value ? 'text-primary' : ''">{{ mode.label }}</span>
+                <span class="block text-[10px] text-muted-foreground mt-0.5">{{ mode.desc }}</span>
               </button>
             </div>
           </div>
@@ -788,7 +1029,7 @@ async function handleDeploy() {
             class="w-full py-3 px-4 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
             @click="currentStep = 2"
           >
-            下一步
+            {{ t('createInstance.nextStep') }}
             <ArrowRight class="w-4 h-4" />
           </button>
           <button
@@ -799,7 +1040,7 @@ async function handleDeploy() {
           >
             <Loader2 v-if="deploying" class="w-4 h-4 animate-spin" />
             <Rocket v-else class="w-4 h-4" />
-            {{ deploying ? '部署中...' : '创建AI 员工' }}
+            {{ deploying ? t('createInstance.deploying') : t('createInstance.deployButton') }}
           </button>
         </div>
       </div>
@@ -809,19 +1050,21 @@ async function handleDeploy() {
         <div class="space-y-3">
           <div class="flex items-center gap-2">
             <Brain class="w-4 h-4 text-violet-400" />
-            <label class="text-sm font-medium">配置大模型</label>
+            <label class="text-sm font-medium">{{ t('createInstance.stepLlmConfig') }}</label>
           </div>
           <p class="text-xs text-muted-foreground">
-            DeskClaw 需要至少一个大模型 API Key 才能正常使用
+            {{ t('llm.providerOptionalHint') }}
           </p>
 
-          <template v-if="!llmSkipped">
             <!-- 已添加的 Provider -->
             <div v-for="(cfg, idx) in llmConfigs" :key="cfg.provider" class="rounded-lg border border-border bg-card p-4 space-y-3">
               <div class="flex items-center justify-between">
                 <div class="flex items-center gap-2">
                   <span class="font-medium text-sm">{{ PROVIDER_LABELS[cfg.provider] || cfg.provider }}</span>
                   <span v-if="cfg.isCustom" class="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-400">{{ t('llm.customProvider') }}</span>
+                  <span v-else-if="cfg.keySource === 'org' && isOrgKeyAvailable(cfg.provider)" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500">
+                    {{ orgKeyLabel }}
+                  </span>
                 </div>
                 <button class="text-muted-foreground hover:text-destructive transition-colors" @click="removeProvider(idx)">
                   <Trash2 class="w-4 h-4" />
@@ -831,81 +1074,123 @@ async function handleDeploy() {
               <!-- API type selector (custom only) -->
               <div v-if="cfg.isCustom" class="flex gap-4 text-sm">
                 <label class="text-xs text-muted-foreground">{{ t('llm.apiType') }}:</label>
-                <label class="flex items-center gap-1.5 cursor-pointer text-xs">
-                  <input type="radio" :name="`apitype-${cfg.provider}`" value="openai-completions" v-model="cfg.apiType" class="accent-primary" />
-                  {{ t('llm.apiTypeOpenai') }}
-                </label>
-                <label class="flex items-center gap-1.5 cursor-pointer text-xs">
-                  <input type="radio" :name="`apitype-${cfg.provider}`" value="anthropic-messages" v-model="cfg.apiType" class="accent-primary" />
-                  {{ t('llm.apiTypeAnthropic') }}
-                </label>
+                <template v-if="cfg.keySource === 'org'">
+                  <span class="text-xs">{{ cfg.apiType === 'anthropic-messages' ? t('llm.apiTypeAnthropic') : t('llm.apiTypeOpenai') }}</span>
+                </template>
+                <template v-else>
+                  <label class="flex items-center gap-1.5 cursor-pointer text-xs">
+                    <input type="radio" :name="`apitype-${cfg.provider}`" value="openai-completions" v-model="cfg.apiType" class="accent-primary" />
+                    {{ t('llm.apiTypeOpenai') }}
+                  </label>
+                  <label class="flex items-center gap-1.5 cursor-pointer text-xs">
+                    <input type="radio" :name="`apitype-${cfg.provider}`" value="anthropic-messages" v-model="cfg.apiType" class="accent-primary" />
+                    {{ t('llm.apiTypeAnthropic') }}
+                  </label>
+                </template>
               </div>
 
               <div class="space-y-2">
-                <div v-if="!cfg.isCustom" class="flex gap-4 text-sm">
+                <div v-if="(!cfg.isCustom || isOrgKeyAvailable(cfg.provider)) && !isCodexProvider(cfg.provider)" class="flex gap-4 text-sm">
                   <span class="relative group">
                     <label
                       class="flex items-center gap-1.5"
-                      :class="isWorkingPlanAvailable(cfg.provider) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'"
+                      :class="isOrgKeyAvailable(cfg.provider) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'"
                     >
-                      <input type="radio" :name="`llm-${cfg.provider}`" value="org" v-model="cfg.keySource" class="accent-primary" :disabled="!isWorkingPlanAvailable(cfg.provider)" />
-                      Working Plan
+                      <input type="radio" :name="`llm-${cfg.provider}`" value="org" v-model="cfg.keySource" class="accent-primary" :disabled="!isOrgKeyAvailable(cfg.provider)" />
+                      {{ orgKeyLabel }}
                     </label>
                     <span
-                      v-if="!isWorkingPlanAvailable(cfg.provider)"
-                      class="pointer-events-none absolute z-50 top-full left-1/2 -translate-x-1/2 mt-1.5 whitespace-nowrap rounded bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md border border-border invisible group-hover:visible"
+                      v-if="!isOrgKeyAvailable(cfg.provider)"
+                      class="pointer-events-none absolute z-50 top-full left-0 mt-1.5 whitespace-nowrap rounded bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md border border-border invisible group-hover:visible"
                     >
-                      {{ WORKING_PLAN_PROVIDERS.has(cfg.provider) ? t('llm.workingPlanNotConfigured') : t('llm.workingPlanUnavailable') }}
+                      {{ t('llm.orgKeyNotConfigured') }}
                     </span>
                   </span>
                   <label class="flex items-center gap-1.5 cursor-pointer">
                     <input type="radio" :name="`llm-${cfg.provider}`" value="personal" v-model="cfg.keySource" class="accent-primary" />
-                    个人 Key
+                    {{ t('llm.personalKey') }}
                   </label>
                 </div>
 
-                <p v-if="!cfg.isCustom && cfg.keySource === 'org'" class="text-xs text-muted-foreground pl-0.5">
-                  使用组织统一配置的 Key，无需自行输入
+                <p v-else-if="isCodexProvider(cfg.provider)" class="text-xs text-muted-foreground pl-0.5">
+                  {{ t('llm.codexCliHint') }}
+                </p>
+
+                <p v-if="cfg.keySource === 'org' && (!cfg.isCustom || isOrgKeyAvailable(cfg.provider))" class="text-xs text-muted-foreground pl-0.5">
+                  {{ t('llm.orgKeyHint') }}
                 </p>
 
                 <div v-if="cfg.keySource === 'personal'" class="space-y-2">
-                  <div class="relative">
-                    <Key class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-                    <input
-                      v-model="cfg.personalKey"
-                      type="password"
-                      placeholder="输入 API Key"
-                      class="w-full pl-9 pr-3 py-1.5 rounded-md bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
-                    />
+                  <div v-if="isCodexProvider(cfg.provider)" class="rounded-md border border-border bg-background px-3 py-2 text-xs text-muted-foreground">
+                    {{ t('llm.codexCliRuntimeHint') }}
                   </div>
-
-                  <!-- Base URL (collapsible for built-in, always visible for custom) -->
-                  <div v-if="cfg.isCustom || cfg.showBaseUrl">
-                    <div class="relative">
-                      <Link class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-                      <input
-                        v-model="cfg.baseUrl"
-                        type="text"
-                        :placeholder="cfg.isCustom ? t('llm.baseUrlPlaceholder') : t('llm.defaultBaseUrl', { url: PROVIDER_DEFAULT_URLS[cfg.provider] || '' })"
-                        :class="cfg.isCustom ? 'pr-3' : 'pr-8'"
-                        class="w-full pl-9 py-1.5 rounded-md bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
-                      />
+                  <template v-else>
+                    <div class="flex items-center gap-2">
+                      <div class="relative flex-1">
+                        <Key class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                        <input
+                          v-model="cfg.personalKey"
+                          type="password"
+                          :placeholder="t('createInstance.apiKeyPlaceholder')"
+                          class="w-full pl-9 pr-3 py-1.5 rounded-md bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
+                        />
+                      </div>
                       <button
-                        v-if="!cfg.isCustom"
-                        class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                        @click="cfg.baseUrl = ''; cfg.showBaseUrl = false"
+                        v-if="cfg.personalKey"
+                        class="shrink-0 flex items-center gap-1 px-2 py-1.5 rounded-md border border-border text-xs hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        :disabled="testingProvider === idx"
+                        @click="handleTestKey(idx)"
                       >
-                        <X class="w-3.5 h-3.5" />
+                        <Loader2 v-if="testingProvider === idx" class="w-3.5 h-3.5 animate-spin" />
+                        <Zap v-else class="w-3.5 h-3.5" />
+                        {{ t('llm.testKey') }}
                       </button>
+                      <span v-if="testResults[idx]?.ok" class="shrink-0 flex items-center gap-1 text-xs text-green-500">
+                        <CheckCircle class="w-3.5 h-3.5" />
+                        {{ testResults[idx].tested_model ? t('llm.testConnectionModel', { model: testResults[idx].tested_model }) : t('llm.testKeyAvailable') }}
+                        <template v-if="testResults[idx].latency_ms != null"> / {{ testResults[idx].latency_ms }}ms</template>
+                      </span>
+                      <span v-else-if="testResults[idx] && !testResults[idx].ok" class="shrink-0 flex items-center gap-1 text-xs text-destructive">
+                        <XCircle class="w-3.5 h-3.5 shrink-0" />
+                        {{ t('llm.testKeyFailed') }}
+                      </span>
                     </div>
-                  </div>
-                  <button
-                    v-if="!cfg.isCustom && !cfg.showBaseUrl"
-                    class="text-xs text-muted-foreground hover:text-foreground transition-colors"
-                    @click="cfg.showBaseUrl = true"
-                  >
-                    {{ t('llm.customBaseUrl') }}
-                  </button>
+                    <div v-if="testResults[idx] && !testResults[idx]?.ok" class="mt-1 px-2 py-1.5 rounded bg-destructive/5 text-xs text-destructive">
+                      {{ testResults[idx].message }}
+                    </div>
+
+                    <div v-if="cfg.isCustom || cfg.showBaseUrl">
+                      <div class="relative">
+                        <Link class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                        <input
+                          v-model="cfg.baseUrl"
+                          type="text"
+                          :placeholder="cfg.isCustom ? t('llm.baseUrlPlaceholder') : t('llm.defaultBaseUrl', { url: PROVIDER_DEFAULT_URLS[cfg.provider] || '' })"
+                          :class="cfg.isCustom ? 'pr-3' : 'pr-8'"
+                          class="w-full pl-9 py-1.5 rounded-md bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/50"
+                        />
+                        <button
+                          v-if="!cfg.isCustom"
+                          class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                          @click="cfg.baseUrl = ''; cfg.showBaseUrl = false"
+                        >
+                          <X class="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <label v-if="cfg.baseUrl" class="flex items-center gap-2 mt-1.5 cursor-pointer">
+                        <input type="checkbox" v-model="cfg.skipSslVerify" class="accent-primary" />
+                        <span class="text-xs">{{ t('orgSettings.llmKeysSkipSslVerify') }}</span>
+                        <span class="text-xs text-muted-foreground">{{ t('orgSettings.llmKeysSkipSslVerifyHint') }}</span>
+                      </label>
+                    </div>
+                    <button
+                      v-if="!cfg.isCustom && !cfg.showBaseUrl"
+                      class="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      @click="cfg.showBaseUrl = true"
+                    >
+                      {{ t('llm.customBaseUrl') }}
+                    </button>
+                  </template>
                 </div>
               </div>
 
@@ -913,17 +1198,16 @@ async function handleDeploy() {
               <ModelSelect
                 :provider="cfg.provider"
                 v-model="cfg.selectedModel"
-                :allow-manual-input="!!cfg.isCustom"
+                allow-manual-input
                 @fetch-models="handleFetchModels"
               />
-              <p v-if="(cfg.isCustom || !BUILTIN_PROVIDERS.has(cfg.provider)) && !cfg.selectedModel" class="text-[10px] text-amber-500">
+              <p v-if="!cfg.selectedModel" class="text-[10px] text-amber-500">
                 {{ t('llm.modelRequired') }}
               </p>
             </div>
 
             <!-- 选择 Provider -->
-            <div v-if="llmConfigs.length === 0 && unusedProviders.length > 0" class="space-y-2">
-              <p class="text-xs text-muted-foreground">选择你使用的大模型服务商</p>
+            <div v-if="unusedProviders.length > 0" class="space-y-2">
               <div class="grid grid-cols-2 gap-2">
                 <button
                   v-for="p in unusedProviders"
@@ -933,9 +1217,23 @@ async function handleDeploy() {
                 >
                   <div class="flex items-center gap-1.5">
                     {{ PROVIDER_LABELS[p] || p }}
-                    <span v-if="WORKING_PLAN_PROVIDERS.has(p)" class="inline-flex items-center gap-0.5 text-[10px] text-amber-500">
+                    <span v-if="orgKeyProviders.has(p)" class="inline-flex items-center gap-0.5 text-[10px] text-amber-500">
                       <Star class="w-3 h-3 fill-amber-500 text-amber-500" />
-                      Working Plan
+                      {{ orgKeyLabel }}
+                    </span>
+                  </div>
+                </button>
+                <button
+                  v-for="ocp in orgCustomProviders"
+                  :key="ocp.provider"
+                  class="px-4 py-3 rounded-lg border border-border bg-card text-sm text-left hover:border-primary/50 hover:bg-primary/5 transition-colors"
+                  @click="addOrgCustomProvider(ocp)"
+                >
+                  <div class="flex items-center gap-1.5">
+                    {{ ocp.label || ocp.provider }}
+                    <span class="inline-flex items-center gap-0.5 text-[10px] text-amber-500">
+                      <Star class="w-3 h-3 fill-amber-500 text-amber-500" />
+                      {{ orgKeyLabel }}
                     </span>
                   </div>
                 </button>
@@ -949,46 +1247,6 @@ async function handleDeploy() {
                   </div>
                 </button>
               </div>
-            </div>
-
-            <!-- 已有 Provider 时的添加按钮 -->
-            <div v-if="llmConfigs.length > 0" class="flex gap-2 items-start">
-              <div v-if="unusedProviders.length > 0" class="relative">
-                <button
-                  class="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  @click="newProviderOpen = !newProviderOpen"
-                >
-                  <Plus class="w-3.5 h-3.5" />
-                  {{ t('common.add') }} Provider
-                  <ChevronDown class="w-3 h-3 transition-transform" :class="newProviderOpen ? 'rotate-180' : ''" />
-                </button>
-                <div
-                  v-if="newProviderOpen"
-                  class="absolute z-10 mt-1 w-56 rounded-lg border border-border bg-card shadow-lg overflow-hidden"
-                >
-                  <button
-                    v-for="p in unusedProviders"
-                    :key="p"
-                    class="w-full px-4 py-2 text-left text-sm hover:bg-accent transition-colors"
-                    @click="addProvider(p)"
-                  >
-                    <div class="flex items-center gap-1.5">
-                      {{ PROVIDER_LABELS[p] || p }}
-                      <span v-if="WORKING_PLAN_PROVIDERS.has(p)" class="inline-flex items-center gap-0.5 text-[10px] text-amber-500">
-                        <Star class="w-3 h-3 fill-amber-500 text-amber-500" />
-                        Working Plan
-                      </span>
-                    </div>
-                  </button>
-                </div>
-              </div>
-              <button
-                class="px-3 py-1.5 rounded-md border border-dashed border-violet-400/50 text-sm text-violet-400 hover:border-violet-400 hover:bg-violet-500/5 transition-colors flex items-center gap-1"
-                @click="showCustomForm = true"
-              >
-                <Plus class="w-3.5 h-3.5" />
-                {{ t('llm.addCustomProvider') }}
-              </button>
             </div>
 
             <!-- 自定义 Provider 表单 -->
@@ -1020,19 +1278,27 @@ async function handleDeploy() {
                 {{ t('common.add') }}
               </button>
             </div>
-          </template>
-
-          <p v-else class="text-xs text-muted-foreground italic">
-            已跳过大模型配置，创建后可在AI 员工设置中配置
-            <button class="text-primary ml-1 not-italic" @click="llmSkipped = false">撤销</button>
-          </p>
         </div>
 
         <!-- 部署 -->
         <div class="pt-4 space-y-3">
           <div v-if="error" class="flex items-start gap-2.5 p-3 rounded-lg bg-destructive/10 border border-destructive/20">
             <AlertCircle class="w-4 h-4 text-destructive shrink-0 mt-0.5" />
-            <p class="text-sm text-destructive leading-relaxed">{{ error }}</p>
+            <div class="flex-1 space-y-1.5">
+              <p class="text-sm text-destructive leading-relaxed">{{ error }}</p>
+              <template v-if="errorKey === 'errors.deploy.ingress_base_domain_required'">
+                <p class="text-xs text-muted-foreground leading-relaxed">
+                  {{ t('errors.deploy.ingress_base_domain_hint') }}
+                </p>
+                <router-link
+                  v-if="authStore.user?.portal_org_role === 'admin'"
+                  to="/org-settings/network"
+                  class="text-xs text-primary hover:underline"
+                >
+                  {{ t('errors.deploy.ingress_base_domain_go_configure') }}
+                </router-link>
+              </template>
+            </div>
           </div>
           <button
             :disabled="!canDeploy"
@@ -1041,14 +1307,7 @@ async function handleDeploy() {
           >
             <Loader2 v-if="deploying" class="w-4 h-4 animate-spin" />
             <Rocket v-else class="w-4 h-4" />
-            {{ deploying ? '部署中...' : '部署' }}
-          </button>
-          <button
-            v-if="!llmSkipped"
-            class="w-full py-2.5 px-4 rounded-lg border border-border text-sm text-muted-foreground hover:text-foreground hover:border-foreground/20 transition-colors text-center"
-            @click="llmSkipped = true; llmConfigs.splice(0); handleDeploy()"
-          >
-            跳过，稍后配置大模型
+            {{ deploying ? t('createInstance.deploying') : t('createInstance.deployNow') }}
           </button>
         </div>
       </div>
@@ -1057,6 +1316,6 @@ async function handleDeploy() {
 
   <!-- 点击外部关闭下拉框 -->
   <Teleport to="body">
-    <div v-if="imageDropdownOpen || scDropdownOpen" class="fixed inset-0 z-5" @click="imageDropdownOpen = false; scDropdownOpen = false" />
+    <div v-if="imageDropdownOpen || scDropdownOpen || clusterDropdownOpen" class="fixed inset-0 z-5" @click="imageDropdownOpen = false; scDropdownOpen = false; clusterDropdownOpen = false" />
   </Teleport>
 </template>

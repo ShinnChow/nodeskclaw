@@ -77,6 +77,14 @@ vue-tsc -b                                # 类型检查
 - 禁止 `db.delete()` 和原生 `DELETE FROM`
 - 唯一约束使用 Partial Unique Index：`Index(..., unique=True, postgresql_where=text("deleted_at IS NULL"))`
 
+### Alembic 迁移规则
+
+新增或修改数据模型后，必须通过 `alembic revision --autogenerate` 生成迁移文件，作为同一个 commit 的一部分。
+
+- 禁止手写 revision ID — 必须由命令自动生成
+- 禁止只加 Model 不加迁移 — 启动时走 `alembic upgrade head`，缺迁移 = 表不存在 = 启动崩溃
+- 生成后 Review：autogenerate 无法检测列重命名，Partial Unique Index 需确认
+
 ### Docker 镜像架构
 
 所有 Docker 操作必须显式指定 `linux/amd64` 平台。
@@ -191,6 +199,14 @@ feat(instance): 实例列表新增搜索和过滤功能
 fix(deploy): 修复 env_vars 存数据库未序列化的问题
 ```
 
+### 社区 PR 合并
+
+- 必须保留外部贡献者的 commit 归属（Author 字段）
+- 使用 `git cherry-pick`（不加 `--no-commit`）保留原始 author
+- 维护者的修复作为独立 commit 叠加在原始 commit 之上
+- 合并前用 `git log --format="%an - %s"` 验证归属正确
+- 禁止 squash merge 吞掉贡献者的 commit
+
 ### 禁止
 
 - 禁止 `Co-authored-by` 署名
@@ -226,7 +242,7 @@ fix(deploy): 修复 env_vars 存数据库未序列化的问题
 ### 目录结构
 
 - `features.yaml` — EE 功能清单定义
-- `ee/` — EE 私有仓库（`.gitignore` 排除，开发者通过 `scripts/setup-ee.sh` 拉取）
+- `ee/` — EE 私有仓库（`.gitignore` 排除，需手动 clone 到项目根目录）
   - `ee/backend/` — EE 后端（路由、Service、Model、Hook）
   - `ee/nodeskclaw-frontend/` — Admin 管理后台前端（EE-only，完整 Vue 项目）
   - `ee/frontend/portal/` — Portal 前端 EE 页面和路由

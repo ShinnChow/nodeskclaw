@@ -4,9 +4,11 @@ import asyncio
 import base64
 import logging
 import re
-from typing import Coroutine
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Coroutine, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.blackboard import Blackboard
@@ -22,6 +24,10 @@ from app.models.workspace_objective import WorkspaceObjective
 from app.models.workspace_schedule import WorkspaceSchedule
 from app.models.workspace_task import WorkspaceTask
 from app.services import storage_service
+from app.services.workspace_defaults import (
+    DEFAULT_WORKSPACE_SCHEDULE_MESSAGE,
+    DEFAULT_WORKSPACE_SCHEDULE_NAME,
+)
 from app.services.runtime import node_card as node_card_service
 from app.schemas.workspace import (
     AddAgentRequest,
@@ -93,6 +99,17 @@ def _agent_brief(inst: Instance, wa: WorkspaceAgent) -> AgentBrief:
 # ── Workspace CRUD ───────────────────────────────────
 
 async def create_workspace(db: AsyncSession, org_id: str, user_id: str, data: WorkspaceCreate) -> WorkspaceInfo:
+    from app.models.cluster import Cluster
+    cluster_result = await db.execute(
+        select(Cluster).where(
+            Cluster.id == data.cluster_id,
+            Cluster.deleted_at.is_(None),
+        )
+    )
+    cluster = cluster_result.scalar_one_or_none()
+    if cluster is None or cluster.org_id != org_id:
+        raise ValueError("集群不存在或不属于当前组织")
+
     ws = Workspace(
         org_id=org_id,
         name=data.name,
@@ -100,6 +117,7 @@ async def create_workspace(db: AsyncSession, org_id: str, user_id: str, data: Wo
         color=data.color,
         icon=data.icon,
         created_by=user_id,
+        cluster_id=data.cluster_id,
     )
     db.add(ws)
     await db.flush()
@@ -122,9 +140,9 @@ async def create_workspace(db: AsyncSession, org_id: str, user_id: str, data: Wo
 
     schedule = WorkspaceSchedule(
         workspace_id=ws.id,
-        name="定时巡检",
+        name=DEFAULT_WORKSPACE_SCHEDULE_NAME,
         cron_expr="0 */4 * * *",
-        message_template="请检查黑板待办任务队列，接取并执行优先级最高的任务。完成后汇报进展。",
+        message_template=DEFAULT_WORKSPACE_SCHEDULE_MESSAGE,
         is_active=False,
     )
     db.add(schedule)
@@ -134,10 +152,15 @@ async def create_workspace(db: AsyncSession, org_id: str, user_id: str, data: Wo
 
     if data.template_id:
         await _apply_template_to_workspace(db, ws.id, data.template_id, user_id)
+        ws.source_template_id = data.template_id
+        await db.commit()
+        await db.refresh(ws)
 
     return WorkspaceInfo(
         id=ws.id, org_id=ws.org_id, name=ws.name, description=ws.description,
         color=ws.color, icon=ws.icon, created_by=ws.created_by,
+        cluster_id=ws.cluster_id,
+        source_template_id=ws.source_template_id,
         agent_count=0, agents=[], created_at=ws.created_at, updated_at=ws.updated_at,
     )
 
@@ -150,7 +173,9 @@ async def _apply_template_to_workspace(
 
     from app.models.base import not_deleted
     from app.models.corridor import CorridorHex, HexConnection, ordered_pair
+    from app.models.node_card import NodeCard
     from app.models.workspace_template import WorkspaceTemplate
+    from app.services.runtime import node_card as node_card_service
 
     result = await db.execute(
         select(WorkspaceTemplate).where(
@@ -177,6 +202,15 @@ async def _apply_template_to_workspace(
                 created_by=user_id,
             )
             db.add(ch)
+            await node_card_service.create_node_card(
+                db,
+                node_type="corridor",
+                node_id=ch.id,
+                workspace_id=workspace_id,
+                hex_q=ch.hex_q,
+                hex_r=ch.hex_r,
+                name=ch.display_name or "",
+            )
 
     await db.flush()
 
@@ -185,7 +219,7 @@ async def _apply_template_to_workspace(
             edge.get("a_q", 0), edge.get("a_r", 0),
             edge.get("b_q", 0), edge.get("b_r", 0),
         )
-        conn = HexConnection(
+        db.add(HexConnection(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
             hex_a_q=aq, hex_a_r=ar,
@@ -193,8 +227,7 @@ async def _apply_template_to_workspace(
             direction=edge.get("direction", "both"),
             auto_created=edge.get("auto_created", False),
             created_by=user_id,
-        )
-        db.add(conn)
+        ))
 
     if "content" in bb_snap:
         bb_result = await db.execute(
@@ -206,6 +239,106 @@ async def _apply_template_to_workspace(
         bb_row = bb_result.scalar_one_or_none()
         if bb_row:
             bb_row.content = bb_snap["content"]
+
+    await db.commit()
+
+
+async def apply_internal_deploy_topology(
+    db: AsyncSession,
+    workspace_id: str,
+    user_id: str,
+    topo_snap: dict,
+    human_specs: list[dict],
+) -> None:
+    """Apply filtered topology snapshot (corridors, connections, human hexes) during template deploy.
+
+    Dual-writes to legacy tables (corridor_hexes/human_hexes) AND node_cards so that
+    existing CRUD endpoints and _is_hex_occupied checks keep working while _build_hex_map
+    (which short-circuits on node_cards) also sees the data.
+    """
+    import uuid
+
+    from app.models.corridor import CorridorHex, HexConnection, HumanHex, ordered_pair
+    from app.services.runtime import node_card as node_card_service
+
+    for node in topo_snap.get("nodes", []):
+        if node.get("node_type") == "corridor":
+            ch = CorridorHex(
+                id=str(uuid.uuid4()),
+                workspace_id=workspace_id,
+                hex_q=node.get("hex_q", 0),
+                hex_r=node.get("hex_r", 0),
+                display_name=node.get("display_name", ""),
+                created_by=user_id,
+            )
+            db.add(ch)
+            await node_card_service.create_node_card(
+                db,
+                node_type="corridor",
+                node_id=ch.id,
+                workspace_id=workspace_id,
+                hex_q=ch.hex_q,
+                hex_r=ch.hex_r,
+                name=ch.display_name or "",
+            )
+
+    for spec in human_specs:
+        hh = HumanHex(
+            id=str(uuid.uuid4()),
+            workspace_id=workspace_id,
+            user_id=user_id,
+            hex_q=spec.get("hex_q", 0),
+            hex_r=spec.get("hex_r", 0),
+            display_name=spec.get("display_name", ""),
+            display_color=spec.get("display_color", "#f59e0b"),
+            channel_type=spec.get("channel_type"),
+            channel_config=spec.get("channel_config"),
+            created_by=user_id,
+        )
+        db.add(hh)
+        await node_card_service.create_node_card(
+            db,
+            node_type="human",
+            node_id=hh.id,
+            workspace_id=workspace_id,
+            hex_q=hh.hex_q,
+            hex_r=hh.hex_r,
+            name=spec.get("display_name", ""),
+            metadata={
+                "user_id": user_id,
+                "display_color": spec.get("display_color", "#f59e0b"),
+                "channel_type": spec.get("channel_type"),
+                "channel_config": spec.get("channel_config"),
+            },
+        )
+
+    await db.flush()
+
+    for edge in topo_snap.get("edges", []):
+        aq, ar, bq, br = ordered_pair(
+            edge.get("a_q", 0), edge.get("a_r", 0),
+            edge.get("b_q", 0), edge.get("b_r", 0),
+        )
+        existing = (await db.execute(
+            select(HexConnection.id).where(
+                HexConnection.workspace_id == workspace_id,
+                HexConnection.hex_a_q == aq,
+                HexConnection.hex_a_r == ar,
+                HexConnection.hex_b_q == bq,
+                HexConnection.hex_b_r == br,
+                HexConnection.deleted_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if existing is None:
+            db.add(HexConnection(
+                id=str(uuid.uuid4()),
+                workspace_id=workspace_id,
+                hex_a_q=aq, hex_a_r=ar,
+                hex_b_q=bq, hex_b_r=br,
+                direction=edge.get("direction", "both"),
+                auto_created=edge.get("auto_created", False),
+                created_by=user_id,
+            ))
 
     await db.commit()
 
@@ -254,6 +387,7 @@ async def list_workspaces(
         items.append(WorkspaceListItem(
             id=ws.id, name=ws.name, description=ws.description,
             color=ws.color, icon=ws.icon,
+            cluster_id=ws.cluster_id,
             agent_count=len(agents),
             agents=[_agent_brief(inst, wa) for inst, wa in agents],
             created_at=ws.created_at,
@@ -283,6 +417,8 @@ async def get_workspace(db: AsyncSession, workspace_id: str) -> WorkspaceInfo | 
     return WorkspaceInfo(
         id=ws.id, org_id=ws.org_id, name=ws.name, description=ws.description,
         color=ws.color, icon=ws.icon, created_by=ws.created_by,
+        cluster_id=ws.cluster_id,
+        source_template_id=ws.source_template_id,
         agent_count=len(agents),
         agents=[_agent_brief(inst, wa) for inst, wa in agents],
         created_at=ws.created_at, updated_at=ws.updated_at,
@@ -328,12 +464,22 @@ async def delete_workspace(db: AsyncSession, workspace_id: str) -> bool:
 # ── Agent management ─────────────────────────────────
 
 async def add_agent(db: AsyncSession, workspace_id: str, data: AddAgentRequest, user_id: str) -> AgentBrief:
+    ws_result = await db.execute(
+        select(Workspace.cluster_id).where(
+            Workspace.id == workspace_id, Workspace.deleted_at.is_(None),
+        )
+    )
+    ws_cluster_id = ws_result.scalar_one_or_none()
+
     result = await db.execute(
         select(Instance).where(Instance.id == data.instance_id, Instance.deleted_at.is_(None))
     )
     inst = result.scalar_one_or_none()
     if inst is None:
         raise ValueError("实例不存在")
+
+    if ws_cluster_id is not None and inst.cluster_id != ws_cluster_id:
+        raise ValueError("该员工不属于本办公室所在集群，无法加入")
 
     existing_wa = await db.execute(
         select(WorkspaceAgent).where(
@@ -509,6 +655,19 @@ async def update_agent(
         wa.hex_q = data.hex_q
     elif data.hex_r is not None:
         wa.hex_r = data.hex_r
+
+    card = await node_card_service.get_node_card(
+        db, node_id=inst.id, workspace_id=workspace_id,
+    )
+    if card:
+        card_updates: dict = {}
+        if position_changed:
+            card_updates["hex_q"] = wa.hex_q
+            card_updates["hex_r"] = wa.hex_r
+        if data.display_name is not None:
+            card_updates["name"] = wa.display_name or inst.name
+        if card_updates:
+            await node_card_service.update_node_card(db, card, **card_updates)
 
     await db.commit()
 
@@ -742,17 +901,65 @@ async def _send_welcome_message(workspace_id: str, inst: Instance) -> None:
 
 # ── Blackboard ───────────────────────────────────────
 
-def _task_to_info(t: WorkspaceTask, assignee_name: str | None = None) -> TaskInfo:
+def _task_to_info(
+    t: WorkspaceTask,
+    assignee_name: str | None = None,
+    *,
+    column_status: str | None = None,
+) -> TaskInfo:
+    if t.status == "archived":
+        status = column_status or "done"
+    else:
+        status = t.status
+    completed_at = t.completed_at or (t.archived_at if t.status == "archived" else None)
     return TaskInfo(
         id=t.id, workspace_id=t.workspace_id, title=t.title,
-        description=t.description, status=t.status, priority=t.priority,
+        description=t.description, status=status, priority=t.priority,
         assignee_instance_id=t.assignee_instance_id, assignee_name=assignee_name,
         created_by_instance_id=t.created_by_instance_id,
         estimated_value=t.estimated_value, actual_value=t.actual_value,
         token_cost=t.token_cost, blocker_reason=t.blocker_reason,
-        completed_at=t.completed_at, archived_at=t.archived_at,
+        completed_at=completed_at, archived_at=t.archived_at,
+        started_at=t.started_at,
+        schedule_id=t.schedule_id, deadline=t.deadline,
+        failure_reason=t.failure_reason,
         created_at=t.created_at, updated_at=t.updated_at,
     )
+
+CONSECUTIVE_FAILURE_THRESHOLD = 3
+
+
+async def update_schedule_failure_count(
+    db: AsyncSession, schedule_id: str | None, *, success: bool, workspace_id: str,
+) -> None:
+    """Update schedule consecutive_failures / last_succeeded_at.
+
+    Does NOT commit — caller controls the transaction boundary.
+    """
+    if not schedule_id:
+        return
+    schedule = await db.get(WorkspaceSchedule, schedule_id)
+    if schedule is None or schedule.deleted_at is not None:
+        return
+
+    if success:
+        schedule.consecutive_failures = 0
+        from datetime import datetime, timezone as _tz
+        schedule.last_succeeded_at = datetime.now(_tz.utc)
+    else:
+        old = schedule.consecutive_failures
+        schedule.consecutive_failures = old + 1
+        new = schedule.consecutive_failures
+        if (old < CONSECUTIVE_FAILURE_THRESHOLD <= new) or (
+            new >= CONSECUTIVE_FAILURE_THRESHOLD and new % CONSECUTIVE_FAILURE_THRESHOLD == 0
+        ):
+            from app.api.workspaces import broadcast_event
+            broadcast_event(workspace_id, "schedule:consecutive_failures", {
+                "schedule_id": schedule.id,
+                "name": schedule.name,
+                "consecutive_failures": new,
+            })
+
 
 def _obj_to_info(o: WorkspaceObjective, children: list[ObjectiveInfo] | None = None) -> ObjectiveInfo:
     return ObjectiveInfo(
@@ -780,7 +987,6 @@ async def get_blackboard(db: AsyncSession, workspace_id: str) -> BlackboardInfo 
         select(WorkspaceTask).where(
             WorkspaceTask.workspace_id == workspace_id,
             WorkspaceTask.deleted_at.is_(None),
-            WorkspaceTask.archived_at.is_(None),
         ).order_by(WorkspaceTask.created_at.desc())
     )).scalars().all()
 
@@ -788,7 +994,10 @@ async def get_blackboard(db: AsyncSession, workspace_id: str) -> BlackboardInfo 
     assignee_map: dict[str, str] = {}
     if instance_ids:
         insts = (await db.execute(
-            select(Instance.id, Instance.name).where(Instance.id.in_(instance_ids))
+            select(Instance.id, Instance.name).where(
+                Instance.id.in_(instance_ids),
+                Instance.deleted_at.is_(None),
+            )
         )).all()
         assignee_map = {r.id: r.name for r in insts}
 
@@ -873,8 +1082,59 @@ async def patch_blackboard_section(
 
 # ── Tasks ────────────────────────────────────────────
 
-VALID_TASK_STATUSES = {"pending", "in_progress", "done", "blocked", "archived"}
+VALID_TASK_STATUSES = {"pending", "in_progress", "done", "blocked", "failed"}
 VALID_TASK_PRIORITIES = {"low", "medium", "high", "urgent"}
+VALID_TASK_BUCKETS = {"active", "inactive", "column"}
+
+
+async def _build_task_assignee_map(
+    db: AsyncSession,
+    rows: Sequence[WorkspaceTask],
+) -> dict[str, str]:
+    instance_ids = {t.assignee_instance_id for t in rows if t.assignee_instance_id}
+    if not instance_ids:
+        return {}
+
+    insts = (await db.execute(
+        select(Instance.id, Instance.name).where(
+            Instance.id.in_(instance_ids),
+            Instance.deleted_at.is_(None),
+        )
+    )).all()
+    return {r.id: r.name for r in insts}
+
+
+def _task_order_by(
+    bucket: Literal["active", "inactive", "column"],
+    status: str | None,
+):
+    if bucket == "column":
+        return (
+            case((WorkspaceTask.status != "archived", 0), else_=1).asc(),
+            case(
+                (WorkspaceTask.status == "done", func.coalesce(WorkspaceTask.completed_at, WorkspaceTask.updated_at)),
+                (WorkspaceTask.status == "archived", func.coalesce(WorkspaceTask.archived_at, WorkspaceTask.updated_at)),
+                else_=WorkspaceTask.created_at,
+            ).desc(),
+            WorkspaceTask.updated_at.desc(),
+            WorkspaceTask.created_at.desc(),
+        )
+    if bucket == "inactive":
+        return (
+            func.coalesce(WorkspaceTask.archived_at, WorkspaceTask.updated_at).desc(),
+            WorkspaceTask.updated_at.desc(),
+            WorkspaceTask.created_at.desc(),
+        )
+    if status == "done":
+        return (
+            func.coalesce(WorkspaceTask.completed_at, WorkspaceTask.updated_at).desc(),
+            WorkspaceTask.updated_at.desc(),
+            WorkspaceTask.created_at.desc(),
+        )
+    return (
+        WorkspaceTask.created_at.desc(),
+        WorkspaceTask.updated_at.desc(),
+    )
 
 
 async def list_tasks(
@@ -885,36 +1145,118 @@ async def list_tasks(
         WorkspaceTask.workspace_id == workspace_id,
         WorkspaceTask.deleted_at.is_(None),
     )
-    if exclude_archived:
-        q = q.where(WorkspaceTask.archived_at.is_(None))
     if status:
-        q = q.where(WorkspaceTask.status == status)
+        if status == "done":
+            q = q.where(WorkspaceTask.status.in_(["done", "archived"]))
+        else:
+            q = q.where(WorkspaceTask.status == status)
     q = q.order_by(WorkspaceTask.created_at.desc())
     rows = (await db.execute(q)).scalars().all()
 
-    instance_ids = {t.assignee_instance_id for t in rows if t.assignee_instance_id}
-    assignee_map: dict[str, str] = {}
-    if instance_ids:
-        insts = (await db.execute(
-            select(Instance.id, Instance.name).where(Instance.id.in_(instance_ids))
-        )).all()
-        assignee_map = {r.id: r.name for r in insts}
+    assignee_map = await _build_task_assignee_map(db, rows)
 
     return [_task_to_info(t, assignee_map.get(t.assignee_instance_id)) for t in rows]
+
+
+async def list_tasks_paginated(
+    db: AsyncSession,
+    workspace_id: str,
+    status: str | None = None,
+    bucket: Literal["active", "inactive", "column"] = "active",
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[TaskInfo], int]:
+    if bucket not in VALID_TASK_BUCKETS:
+        return [], 0
+
+    column_status: str | None = None
+
+    if bucket == "inactive":
+        if status not in {None, "done", "archived"}:
+            return [], 0
+        filters = [
+            WorkspaceTask.workspace_id == workspace_id,
+            WorkspaceTask.deleted_at.is_(None),
+            WorkspaceTask.status == "archived",
+        ]
+    elif bucket == "column":
+        if status is None or status not in VALID_TASK_STATUSES:
+            return [], 0
+        column_status = status
+        filters = [
+            WorkspaceTask.workspace_id == workspace_id,
+            WorkspaceTask.deleted_at.is_(None),
+            or_(
+                WorkspaceTask.status == status,
+                and_(
+                    WorkspaceTask.status == "archived",
+                    WorkspaceTask.archived_from_status == status,
+                ),
+            ),
+        ]
+    else:
+        filters = [
+            WorkspaceTask.workspace_id == workspace_id,
+            WorkspaceTask.deleted_at.is_(None),
+        ]
+        if status == "archived":
+            return [], 0
+        if status is not None:
+            if status not in VALID_TASK_STATUSES:
+                return [], 0
+            filters.append(WorkspaceTask.status == status)
+        else:
+            filters.append(WorkspaceTask.status.in_(tuple(sorted(VALID_TASK_STATUSES))))
+
+    total = int((await db.execute(
+        select(func.count()).select_from(WorkspaceTask).where(*filters)
+    )).scalar_one())
+
+    q = (
+        select(WorkspaceTask)
+        .where(*filters)
+        .order_by(*_task_order_by(bucket, status))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    rows = (await db.execute(q)).scalars().all()
+    assignee_map = await _build_task_assignee_map(db, rows)
+    return [
+        _task_to_info(t, assignee_map.get(t.assignee_instance_id), column_status=column_status)
+        for t in rows
+    ], total
+
+
+async def _resolve_assignee_id(
+    db: AsyncSession, workspace_id: str, raw_id: str | None,
+) -> str | None:
+    """Resolve assignee_id that may be a display name into an instance UUID."""
+    if not raw_id:
+        return None
+    from app.services.collaboration_service import looks_like_uuid, find_agent_by_name_or_id
+    if looks_like_uuid(raw_id):
+        return raw_id
+    inst = await find_agent_by_name_or_id(db, workspace_id, raw_id)
+    return inst.id if inst else None
 
 
 async def create_task(
     db: AsyncSession, workspace_id: str, data: TaskCreate,
     created_by_instance_id: str | None = None,
+    schedule_id: str | None = None,
+    deadline: datetime | None = None,
 ) -> TaskInfo:
+    resolved_assignee = await _resolve_assignee_id(db, workspace_id, data.assignee_id)
     task = WorkspaceTask(
         workspace_id=workspace_id,
         title=data.title,
         description=data.description,
         priority=data.priority if data.priority in VALID_TASK_PRIORITIES else "medium",
-        assignee_instance_id=data.assignee_id,
+        assignee_instance_id=resolved_assignee,
         created_by_instance_id=created_by_instance_id,
         estimated_value=data.estimated_value,
+        schedule_id=schedule_id,
+        deadline=deadline,
     )
     db.add(task)
     await db.commit()
@@ -923,7 +1265,10 @@ async def create_task(
     assignee_name = None
     if task.assignee_instance_id:
         inst = (await db.execute(
-            select(Instance.name).where(Instance.id == task.assignee_instance_id)
+            select(Instance.name).where(
+                Instance.id == task.assignee_instance_id,
+                Instance.deleted_at.is_(None),
+            )
         )).scalar_one_or_none()
         assignee_name = inst
     return _task_to_info(task, assignee_name)
@@ -951,16 +1296,21 @@ async def update_task(
         task.title = data.title
     if data.description is not None:
         task.description = data.description
-    if data.status is not None and data.status in VALID_TASK_STATUSES:
-        task.status = data.status
-        if data.status == "done" and task.completed_at is None:
+    normalized_status = "done" if data.status == "archived" else data.status
+    if normalized_status is not None and normalized_status in VALID_TASK_STATUSES:
+        task.status = normalized_status
+        if normalized_status == "in_progress" and task.started_at is None:
+            task.started_at = datetime.now(tz.utc)
+        if normalized_status == "done" and task.completed_at is None:
             task.completed_at = datetime.now(tz.utc)
-        if data.status == "archived" and task.archived_at is None:
-            task.archived_at = datetime.now(tz.utc)
+        if normalized_status != "done":
+            task.archived_at = None
     if data.priority is not None and data.priority in VALID_TASK_PRIORITIES:
         task.priority = data.priority
     if data.assignee_id is not None:
-        task.assignee_instance_id = data.assignee_id
+        task.assignee_instance_id = await _resolve_assignee_id(
+            db, workspace_id, data.assignee_id,
+        ) or data.assignee_id
     if data.estimated_value is not None:
         task.estimated_value = data.estimated_value
     if data.actual_value is not None:
@@ -969,6 +1319,9 @@ async def update_task(
         task.token_cost = data.token_cost
     if data.blocker_reason is not None:
         task.blocker_reason = data.blocker_reason
+    if normalized_status == "failed" and task.schedule_id and not task.failure_reason:
+        from app.models.workspace_task import FAILURE_AGENT_REPORTED
+        task.failure_reason = FAILURE_AGENT_REPORTED
 
     await db.commit()
     await db.refresh(task)
@@ -976,7 +1329,10 @@ async def update_task(
     assignee_name = None
     if task.assignee_instance_id:
         inst = (await db.execute(
-            select(Instance.name).where(Instance.id == task.assignee_instance_id)
+            select(Instance.name).where(
+                Instance.id == task.assignee_instance_id,
+                Instance.deleted_at.is_(None),
+            )
         )).scalar_one_or_none()
         assignee_name = inst
 
@@ -988,8 +1344,6 @@ async def update_task(
 
 
 async def archive_task(db: AsyncSession, workspace_id: str, task_id: str) -> TaskInfo | None:
-    from datetime import datetime, timezone as tz
-
     result = await db.execute(
         select(WorkspaceTask).where(
             WorkspaceTask.id == task_id,
@@ -1000,10 +1354,6 @@ async def archive_task(db: AsyncSession, workspace_id: str, task_id: str) -> Tas
     task = result.scalar_one_or_none()
     if task is None:
         return None
-    task.status = "archived"
-    task.archived_at = datetime.now(tz.utc)
-    await db.commit()
-    await db.refresh(task)
     return _task_to_info(task)
 
 
@@ -1088,6 +1438,7 @@ async def list_workspace_members(db: AsyncSession, workspace_id: str) -> list[Wo
         select(WorkspaceMember, User).join(User, WorkspaceMember.user_id == User.id).where(
             WorkspaceMember.workspace_id == workspace_id,
             WorkspaceMember.deleted_at.is_(None),
+            User.deleted_at.is_(None),
         )
     )
     members = []
@@ -1133,7 +1484,9 @@ async def add_workspace_member(
     db.add(wm)
     await db.commit()
 
-    user_result = await db.execute(select(User).where(User.id == user_id))
+    user_result = await db.execute(
+        select(User).where(User.id == user_id, User.deleted_at.is_(None))
+    )
     user = user_result.scalar_one()
     return WorkspaceMemberInfo(
         user_id=user.id, user_name=user.name,
@@ -1234,6 +1587,7 @@ def _reply_to_info(r: BlackboardReply) -> ReplyInfo:
     return ReplyInfo(
         id=r.id,
         post_id=r.post_id,
+        floor_number=r.floor_number,
         content=r.content,
         author_type=r.author_type,
         author_id=r.author_id,
@@ -1422,8 +1776,17 @@ async def create_reply(
     if post is None:
         return None
 
+    floor_result = await db.execute(
+        select(func.max(BlackboardReply.floor_number)).where(
+            BlackboardReply.post_id == post_id,
+            BlackboardReply.deleted_at.is_(None),
+        )
+    )
+    next_floor_number = (floor_result.scalar_one_or_none() or 0) + 1
+
     reply = BlackboardReply(
         post_id=post_id,
+        floor_number=next_floor_number,
         content=data.content,
         author_type=author_type,
         author_id=author_id,
@@ -1593,35 +1956,38 @@ async def create_shared_directory(
     return _file_to_info(d)
 
 
-async def upload_shared_file(
+async def upload_shared_file_bytes(
     db: AsyncSession,
     workspace_id: str,
     uploader_type: str,
     uploader_id: str,
     uploader_name: str,
-    data: FileWriteRequest,
+    *,
+    filename: str,
+    file_bytes: bytes,
+    content_type: str,
+    parent_path: str = "/",
 ) -> FileInfo:
-    parent_path = _validate_path(data.parent_path)
-    file_bytes = base64.b64decode(data.content)
-    tos_key = await storage_service.upload_file(
-        file_bytes, data.filename, data.content_type,
+    parent_path = _validate_path(parent_path)
+    storage_key = await storage_service.upload_file(
+        file_bytes, filename, content_type,
         workspace_id,
     )
     existing = (await db.execute(
         select(BlackboardFile).where(
             BlackboardFile.workspace_id == workspace_id,
             BlackboardFile.parent_path == parent_path,
-            BlackboardFile.name == data.filename,
+            BlackboardFile.name == filename,
             BlackboardFile.deleted_at.is_(None),
         )
     )).scalar_one_or_none()
 
     if existing is not None:
-        if existing.tos_key:
-            await storage_service.delete_file(existing.tos_key)
-        existing.tos_key = tos_key
+        if existing.storage_key:
+            await storage_service.delete_file(existing.storage_key)
+        existing.storage_key = storage_key
         existing.file_size = len(file_bytes)
-        existing.content_type = data.content_type
+        existing.content_type = content_type
         existing.uploader_type = uploader_type
         existing.uploader_id = uploader_id
         existing.uploader_name = uploader_name
@@ -1632,11 +1998,11 @@ async def upload_shared_file(
     f = BlackboardFile(
         workspace_id=workspace_id,
         parent_path=parent_path,
-        name=data.filename,
+        name=filename,
         is_directory=False,
         file_size=len(file_bytes),
-        content_type=data.content_type,
-        tos_key=tos_key,
+        content_type=content_type,
+        storage_key=storage_key,
         uploader_type=uploader_type,
         uploader_id=uploader_id,
         uploader_name=uploader_name,
@@ -1645,6 +2011,52 @@ async def upload_shared_file(
     await db.commit()
     await db.refresh(f)
     return _file_to_info(f)
+
+
+async def upload_shared_file(
+    db: AsyncSession,
+    workspace_id: str,
+    uploader_type: str,
+    uploader_id: str,
+    uploader_name: str,
+    data: FileWriteRequest,
+) -> FileInfo:
+    file_bytes = base64.b64decode(data.content)
+    return await upload_shared_file_bytes(
+        db, workspace_id, uploader_type, uploader_id, uploader_name,
+        filename=data.filename, file_bytes=file_bytes,
+        content_type=data.content_type, parent_path=data.parent_path,
+    )
+
+
+async def copy_shared_file(
+    db: AsyncSession,
+    workspace_id: str,
+    uploader_type: str,
+    uploader_id: str,
+    uploader_name: str,
+    file_id: str,
+    target_parent_path: str,
+    target_filename: str | None = None,
+) -> FileInfo | None:
+    source = (await db.execute(
+        select(BlackboardFile).where(
+            BlackboardFile.id == file_id,
+            BlackboardFile.workspace_id == workspace_id,
+            BlackboardFile.is_directory.is_(False),
+            BlackboardFile.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if source is None or not source.storage_key:
+        return None
+    content = await storage_service.download_file(source.storage_key)
+    return await upload_shared_file_bytes(
+        db, workspace_id, uploader_type, uploader_id, uploader_name,
+        filename=target_filename or source.name,
+        file_bytes=content,
+        content_type=source.content_type,
+        parent_path=target_parent_path,
+    )
 
 
 async def get_shared_file_url(
@@ -1659,9 +2071,9 @@ async def get_shared_file_url(
         )
     )
     f = result.scalar_one_or_none()
-    if f is None or not f.tos_key:
+    if f is None or not f.storage_key:
         return None
-    return await storage_service.get_presigned_url(f.tos_key)
+    return await storage_service.get_presigned_url(f.storage_key)
 
 
 async def read_shared_file(
@@ -1677,15 +2089,11 @@ async def read_shared_file(
         )
     )
     f = result.scalar_one_or_none()
-    if f is None or not f.tos_key:
+    if f is None or not f.storage_key:
         return None
 
-    url = await storage_service.get_presigned_url(f.tos_key, expires=300)
-    import httpx
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-    return base64.b64encode(resp.content).decode(), f.content_type
+    content = await storage_service.download_file(f.storage_key)
+    return base64.b64encode(content).decode(), f.content_type
 
 
 async def delete_shared_file(
@@ -1710,12 +2118,56 @@ async def delete_shared_file(
             )
         )).scalars().all()
         for child in children:
-            if child.tos_key:
-                await storage_service.delete_file(child.tos_key)
+            if child.storage_key:
+                await storage_service.delete_file(child.storage_key)
             child.soft_delete()
     else:
-        if f.tos_key:
-            await storage_service.delete_file(f.tos_key)
+        if f.storage_key:
+            await storage_service.delete_file(f.storage_key)
     f.soft_delete()
     await db.commit()
     return True
+
+
+async def restart_all_instances(workspace_id: str, db: AsyncSession) -> dict:
+    from app.services import instance_service
+
+    agents_result = await db.execute(
+        select(Instance, WorkspaceAgent).join(
+            WorkspaceAgent,
+            (WorkspaceAgent.instance_id == Instance.id) & (WorkspaceAgent.deleted_at.is_(None)),
+        ).where(
+            WorkspaceAgent.workspace_id == workspace_id,
+            Instance.deleted_at.is_(None),
+        )
+    )
+    agents = agents_result.all()
+
+    restartable = [
+        (inst, wa) for inst, wa in agents
+        if inst.status in ("running", "learning")
+    ]
+
+    if not restartable:
+        return {"total": len(agents), "succeeded": 0, "failed": 0, "skipped": len(agents), "details": []}
+
+    details = []
+    succeeded = 0
+    failed = 0
+    for inst, _wa in restartable:
+        try:
+            await instance_service.restart_instance(inst.id, db)
+            succeeded += 1
+            details.append({"instance_id": inst.id, "name": inst.name, "status": "ok"})
+        except Exception as exc:
+            failed += 1
+            details.append({"instance_id": inst.id, "name": inst.name, "status": "failed", "error": str(exc)[:200]})
+            logger.warning("批量重启: 实例 %s 失败: %s", inst.name, exc)
+
+    return {
+        "total": len(agents),
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": len(agents) - len(restartable),
+        "details": details,
+    }

@@ -45,7 +45,7 @@ docker compose -f docker-compose.yml -f docker-compose.ee.yml up -d  # EE 模式
 # cp .env.example nodeskclaw-backend/.env && vi nodeskclaw-backend/.env
 ```
 
-Docker Compose 部署自动配置 Docker socket 挂载和数据目录映射，支持创建 Docker 类型集群。`DOCKER_DATA_DIR` 默认为 `$HOME/.nodeskclaw/docker-instances`，`NODESKCLAW_EDITION` 由 compose 文件自动设置。
+Docker Compose 部署自动配置 Docker socket 挂载和数据目录映射，支持创建 Docker 类型集群。Mac/Linux 默认使用 `$HOME/.nodeskclaw/docker-instances`，Windows 必须显式设置 `NODESKCLAW_DATA_DIR`，后端容器内 `DOCKER_DATA_DIR` 固定为 `/nodeskclaw-data`，`NODESKCLAW_EDITION` 由 compose 文件自动设置。
 
 ### 后端（Python）
 
@@ -120,6 +120,7 @@ kubectl get deploy -n <namespace> --context <context-name>
 - **Docker 操作必须指定 `--platform linux/amd64`**（开发机 Apple Silicon arm64，目标集群 amd64）
 - **涉及 K8s/DeskClaw 问题必须用 kubectl 实际查看集群状态**
 - **所有数据删除必须软删除**（设置 `deleted_at`），唯一约束使用 Partial Unique Index
+- **新增/修改 Model 必须同步生成 Alembic 迁移**（`uv run alembic revision --autogenerate`），禁止手写 revision ID
 - **JSONC 配置文件解析前必须剥离行注释**
 - **NFS 路径需正确转换**（容器路径 ↔ 本地挂载路径）
 - **修改代码后必须搜索同源逻辑副本并同步修改**
@@ -156,5 +157,6 @@ kubectl get deploy -n <namespace> --context <context-name>
 - type: feat / fix / docs / style / refactor / perf / test / chore
 - subject 必须使用中文
 - 禁止在 commit message 中出现 `Co-authored-by` 标签
+- **社区 PR 必须保留原作者归属**：cherry-pick 保留 author，修复作为独立 commit 叠加，禁止 `--no-commit` 后重新提交
 
 详见 `.cursor/rules/` 下的规则文件。
