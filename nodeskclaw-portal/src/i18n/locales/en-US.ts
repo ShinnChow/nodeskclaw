@@ -506,6 +506,8 @@ const enUS = {
     none: "None",
     progressTitle: "Deploying ({done}/{total})",
     progressDone: "Deploy complete",
+    progressPartial: "Deploy partially complete",
+    progressFailed: "Deploy failed",
     statusPending: "Pending",
     statusDeploying: "Deploying",
     statusGeneInstall: "Installing genes",

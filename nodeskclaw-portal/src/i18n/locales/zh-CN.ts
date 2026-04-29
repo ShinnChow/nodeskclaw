@@ -506,6 +506,8 @@ const zhCN = {
     none: "无",
     progressTitle: "正在部署 ({done}/{total})",
     progressDone: "部署完成",
+    progressPartial: "部署部分完成",
+    progressFailed: "部署失败",
     statusPending: "等待中",
     statusDeploying: "部署中",
     statusGeneInstall: "安装基因",
