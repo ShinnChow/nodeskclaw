@@ -1863,7 +1863,7 @@ const enUS = {
     providerSlugInvalid: "Invalid format: lowercase letters/numbers/hyphens, no leading/trailing hyphen",
     providerSlugConflict: "Cannot use a built-in provider name",
     baseUrl: "Base URL",
-    baseUrlPlaceholder: "e.g. https://api.deepseek.com/v1",
+    baseUrlPlaceholder: "e.g. api.deepseek.com/v1",
     customBaseUrl: "Custom Base URL",
     apiType: "API Compatibility",
     apiTypeOpenai: "OpenAI Compatible",

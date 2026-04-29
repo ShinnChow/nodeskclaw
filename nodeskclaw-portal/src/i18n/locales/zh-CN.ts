@@ -1863,7 +1863,7 @@ const zhCN = {
     providerSlugInvalid: "格式不合法：小写字母/数字/连字符，不能以连字符开头或结尾",
     providerSlugConflict: "不能与内置 Provider 名称相同",
     baseUrl: "Base URL",
-    baseUrlPlaceholder: "如 https://api.deepseek.com/v1",
+    baseUrlPlaceholder: "如 api.deepseek.com/v1",
     customBaseUrl: "自定义 Base URL",
     apiType: "API 兼容类型",
     apiTypeOpenai: "OpenAI Compatible",
