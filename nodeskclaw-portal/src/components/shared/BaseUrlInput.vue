@@ -1,12 +1,14 @@
-<script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue'
-import { ChevronDown, X } from 'lucide-vue-next'
-
+<script lang="ts">
 export type Protocol = 'https://' | 'http://'
 
 export function stripProtocol(url: string): string {
   return url.replace(/^https?:\/\//, '')
 }
+</script>
+
+<script setup lang="ts">
+import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { ChevronDown, X } from 'lucide-vue-next'
 
 const props = withDefaults(
   defineProps<{
