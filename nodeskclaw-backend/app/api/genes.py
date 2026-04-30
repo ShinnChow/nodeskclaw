@@ -1,9 +1,15 @@
 """Gene Evolution Ecosystem API routes."""
 
+import logging
+import re
+
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_db
+from app.core.config import settings
+from app.core.deps import get_current_org, get_db
+from app.core.exceptions import BadRequestError, NotFoundError
 from app.core.security import get_current_user
 from app.models.user import User
 from app.schemas.common import ApiResponse, PaginatedResponse, Pagination
@@ -25,7 +31,34 @@ from app.schemas.gene import (
 )
 from app.services import gene_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _validate_gene_callback_auth(
+    payload: LearningCallbackPayload,
+    mode: str,
+    sig: str | None,
+    instance_id: str | None,
+) -> None:
+    if sig or instance_id:
+        if not sig or not instance_id:
+            raise BadRequestError("回调签名参数不完整")
+        if payload.instance_id != instance_id:
+            raise BadRequestError("回调实例与签名参数不匹配")
+        if not gene_service.verify_gene_callback_signature(payload, mode, sig):
+            raise BadRequestError("回调签名无效")
+        return
+
+    if not settings.ALLOW_LEGACY_GENE_CALLBACKS:
+        raise BadRequestError("缺少回调签名参数")
+
+    logger.warning(
+        "Allowing legacy unsigned gene callback mode=%s task_id=%s instance_id=%s",
+        mode,
+        payload.task_id,
+        payload.instance_id,
+    )
 
 
 # ═══════════════════════════════════════════════════
@@ -76,53 +109,53 @@ async def featured_genes(
     return ApiResponse(data=genes)
 
 
-@router.get("/genes/{gene_id}")
+@router.get("/genes/{gene_slug}")
 async def get_gene(
-    gene_id: str,
+    gene_slug: str,
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    gene = await gene_service.get_gene(db, gene_id)
+    gene = await gene_service.get_gene(db, gene_slug)
     return ApiResponse(data=gene)
 
 
-@router.get("/genes/{gene_id}/variants")
+@router.get("/genes/{gene_slug}/variants")
 async def gene_variants(
-    gene_id: str,
+    gene_slug: str,
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    variants = await gene_service.get_gene_variants(db, gene_id)
+    variants = await gene_service.get_gene_variants(db, gene_slug)
     return ApiResponse(data=variants)
 
 
-@router.get("/genes/{gene_id}/synergies")
+@router.get("/genes/{gene_slug}/synergies")
 async def gene_synergies(
-    gene_id: str,
+    gene_slug: str,
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    synergies = await gene_service.get_gene_synergies(db, gene_id)
+    synergies = await gene_service.get_gene_synergies(db, gene_slug)
     return ApiResponse(data=synergies)
 
 
-@router.get("/genes/{gene_id}/genomes")
+@router.get("/genes/{gene_slug}/genomes")
 async def gene_genomes(
-    gene_id: str,
+    gene_slug: str,
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    data = await gene_service.get_gene_genomes(db, gene_id)
+    data = await gene_service.get_gene_genomes(db, gene_slug)
     return ApiResponse(data=data)
 
 
-@router.get("/genes/{gene_id}/installed-instances")
+@router.get("/genes/{gene_slug}/installed-instances")
 async def gene_installed_instances(
-    gene_id: str,
+    gene_slug: str,
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    ids = await gene_service.get_gene_installed_instance_ids(db, gene_id)
+    ids = await gene_service.get_gene_installed_instance_ids(db, gene_slug)
     return ApiResponse(data=ids)
 
 
@@ -197,9 +230,10 @@ async def rate_genome(
 async def instance_genes(
     instance_id: str,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    genes = await gene_service.get_instance_genes(db, instance_id)
+    _current_user, org = org_ctx
+    genes = await gene_service.get_instance_genes(db, instance_id, org.id)
     return ApiResponse(data=genes)
 
 
@@ -207,10 +241,75 @@ async def instance_genes(
 async def instance_skills(
     instance_id: str,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    skills = await gene_service.get_instance_skills(db, instance_id)
+    _current_user, org = org_ctx
+    skills = await gene_service.get_instance_skills(db, instance_id, org.id)
     return ApiResponse(data=skills)
+
+
+_SAFE_SKILL_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+class _SkillContentUpdate(BaseModel):
+    content: str
+
+
+@router.get("/instances/{instance_id}/skills/{skill_name}/content")
+async def get_skill_content(
+    instance_id: str,
+    skill_name: str,
+    db: AsyncSession = Depends(get_db),
+    org_ctx=Depends(get_current_org),
+):
+    if not _SAFE_SKILL_NAME.match(skill_name):
+        raise BadRequestError(message="skill_name 包含非法字符")
+
+    _current_user, org = org_ctx
+    from app.services.instance_service import get_instance
+    instance = await get_instance(instance_id, db, org.id)
+
+    from app.services.runtime.registries.runtime_registry import RUNTIME_REGISTRY
+    spec = RUNTIME_REGISTRY.get(instance.runtime)
+    skills_dir = spec.skills_dir_rel if spec else ".openclaw/skills"
+
+    from app.services.nfs_mount import remote_fs
+    async with remote_fs(instance, db) as fs:
+        content = await fs.read_text(f"{skills_dir}/{skill_name}/SKILL.md")
+
+    if content is None:
+        raise NotFoundError(message=f"Skill '{skill_name}' 不存在")
+
+    return ApiResponse(data={"skill_name": skill_name, "content": content})
+
+
+@router.put("/instances/{instance_id}/skills/{skill_name}/content")
+async def update_skill_content(
+    instance_id: str,
+    skill_name: str,
+    body: _SkillContentUpdate,
+    db: AsyncSession = Depends(get_db),
+    org_ctx=Depends(get_current_org),
+):
+    if not _SAFE_SKILL_NAME.match(skill_name):
+        raise BadRequestError(message="skill_name 包含非法字符")
+
+    _current_user, org = org_ctx
+    from app.services.instance_service import get_instance
+    instance = await get_instance(instance_id, db, org.id)
+
+    from app.services.runtime.registries.runtime_registry import RUNTIME_REGISTRY
+    spec = RUNTIME_REGISTRY.get(instance.runtime)
+    skills_dir = spec.skills_dir_rel if spec else ".openclaw/skills"
+
+    from app.services.nfs_mount import remote_fs
+    async with remote_fs(instance, db) as fs:
+        existing = await fs.read_text(f"{skills_dir}/{skill_name}/SKILL.md")
+        if existing is None:
+            raise NotFoundError(message=f"Skill '{skill_name}' 不存在")
+        await fs.write_text(f"{skills_dir}/{skill_name}/SKILL.md", body.content)
+
+    return ApiResponse(data={"skill_name": skill_name, "updated": True})
 
 
 @router.post("/instances/{instance_id}/genes/install")
@@ -218,9 +317,10 @@ async def install_gene(
     instance_id: str,
     req: InstallGeneRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    result = await gene_service.install_gene(db, instance_id, req.gene_slug)
+    _current_user, org = org_ctx
+    result = await gene_service.install_gene(db, instance_id, req.gene_slug, org_id=org.id)
     return ApiResponse(data=result)
 
 
@@ -229,9 +329,10 @@ async def uninstall_gene(
     instance_id: str,
     req: UninstallGeneRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    result = await gene_service.uninstall_gene(db, instance_id, req.gene_id)
+    _current_user, org = org_ctx
+    result = await gene_service.uninstall_gene(db, instance_id, req.gene_id, org_id=org.id)
     return ApiResponse(data=result)
 
 
@@ -240,9 +341,10 @@ async def apply_genome(
     instance_id: str,
     req: ApplyGenomeRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    result = await gene_service.apply_genome(db, instance_id, req.genome_id)
+    _current_user, org = org_ctx
+    result = await gene_service.apply_genome(db, instance_id, req.genome_id, org.id)
     return ApiResponse(data=result)
 
 
@@ -257,8 +359,10 @@ async def publish_variant(
     gene_id: str,
     req: PublishVariantRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
+    _current_user, org = org_ctx
+    await gene_service.get_instance_genes(db, instance_id, org.id)
     result = await gene_service.publish_variant(
         db, instance_id, gene_id, req.variant_name, req.variant_slug
     )
@@ -271,8 +375,10 @@ async def log_effectiveness(
     gene_id: str,
     req: EffectivenessRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
+    _current_user, org = org_ctx
+    await gene_service.get_instance_genes(db, instance_id, org.id)
     result = await gene_service.log_effectiveness(
         db, instance_id, gene_id, req.metric_type, req.value, req.context
     )
@@ -284,9 +390,10 @@ async def create_gene_from_agent(
     instance_id: str,
     req: CreateGeneRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    result = await gene_service.trigger_gene_creation(db, instance_id, req.creation_prompt)
+    _current_user, org = org_ctx
+    result = await gene_service.trigger_gene_creation(db, instance_id, req.creation_prompt, org.id)
     return ApiResponse(data=result)
 
 
@@ -298,8 +405,11 @@ async def create_gene_from_agent(
 @router.post("/genes/learning-callback")
 async def learning_callback(
     payload: LearningCallbackPayload,
+    sig: str | None = Query(None),
+    instance_id: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    _validate_gene_callback_auth(payload, "learn", sig, instance_id)
     result = await gene_service.handle_learning_callback(db, payload)
     return ApiResponse(data=result)
 
@@ -307,8 +417,11 @@ async def learning_callback(
 @router.post("/genes/creation-callback")
 async def creation_callback(
     payload: LearningCallbackPayload,
+    sig: str | None = Query(None),
+    instance_id: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    _validate_gene_callback_auth(payload, "create", sig, instance_id)
     result = await gene_service.handle_creation_callback(db, payload)
     return ApiResponse(data=result)
 
@@ -316,8 +429,11 @@ async def creation_callback(
 @router.post("/genes/forgetting-callback")
 async def forgetting_callback(
     payload: LearningCallbackPayload,
+    sig: str | None = Query(None),
+    instance_id: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    _validate_gene_callback_auth(payload, "forget", sig, instance_id)
     result = await gene_service.handle_forgetting_callback(db, payload)
     return ApiResponse(data=result)
 
@@ -333,9 +449,10 @@ async def get_evolution_log(
     page: int = 1,
     page_size: int = 20,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    org_ctx=Depends(get_current_org),
 ):
-    events = await gene_service.get_evolution_log(db, instance_id, page, page_size)
+    _current_user, org = org_ctx
+    events = await gene_service.get_evolution_log(db, instance_id, page, page_size, org.id)
     return ApiResponse(data=events)
 
 

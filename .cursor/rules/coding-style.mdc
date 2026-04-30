@@ -6,6 +6,24 @@ alwaysApply: true
 
 # 编码风格
 
+## UX / UI 质量优先
+
+**UX 和 UI 对产品至关重要。每一次涉及前端的改动，都必须从用户体验角度审视，不能只做"功能实现"就收工。**
+
+### 必须做
+
+- **错误提示必须可操作**：用户看到错误后，必须知道下一步该做什么。错误文案要包含具体的操作指引（如"请前往系统设置配置 xxx"），能加跳转链接就加跳转链接
+- **空状态必须有引导**：列表为空、配置缺失、权限不足等场景，必须告诉用户"为什么"和"怎么办"，不能只显示一个空白页面
+- **操作反馈必须即时**：按钮点击后要有 loading 状态，异步操作要有进度或结果提示，不能让用户猜"到底有没有成功"
+- **每个改动都要自问**：如果我是第一次用这个产品的用户，看到这个界面/提示/报错，我能立刻知道该怎么做吗？不能就说明 UX 不合格
+- **主动发现 UX 缺陷**：在实现功能的过程中如果发现现有 UX 有问题（如缺少引导、报错不明确、操作路径不清晰），主动报告给用户并建议改进
+
+### 严禁
+
+- **禁止"功能做完就完了"**：功能实现只是及格线，用户体验才是目标
+- **禁止忽略边缘场景的 UX**：错误状态、加载状态、空状态、权限不足状态，都是用户会遇到的真实场景，不能只关注 happy path
+- **禁止把 UX 优化当"锦上添花"**：UX 问题就是 bug，不是"有空再说"的低优先级事项
+
 ## Emoji 使用规则
 
 **未经用户明确允许，禁止在任何地方使用 emoji。** 包括但不限于：
@@ -380,6 +398,32 @@ UniqueConstraint("col_a", "col_b", name="uq_xxx")
 - **禁止 `DELETE FROM`**：不允许原生 SQL 物理删除
 - **禁止遗漏过滤**：新增查询必须包含 `deleted_at.is_(None)` 条件，否则会查到已删除的数据
 - **禁止使用 `UniqueConstraint`**：所有唯一约束必须用 Partial Unique Index（见上）
+
+## Alembic 迁移规则
+
+**新增或修改数据模型后，必须通过 `alembic revision --autogenerate` 生成迁移文件。禁止手写迁移文件。**
+
+项目启动时走 `alembic upgrade head`（不走 `create_all`），缺少迁移 = 表不存在 = 启动崩溃。
+
+### 必须做
+
+- **新增/修改 Model 后立刻生成迁移**：`uv run alembic revision --autogenerate -m "描述"`，作为同一个 commit 的一部分
+- **Review 生成的迁移文件**：autogenerate 无法检测列重命名（会生成 DROP + ADD）、Partial Unique Index 可能需手动调整
+- **迁移文件必须提交到 Git**：`alembic/versions/` 下的文件是代码的一部分
+
+### 严禁
+
+- **禁止手写 revision ID**：必须由 `alembic revision` 命令自动生成。手写假 ID（如 `a1b2c3d4e5f6`）曾导致 revision 冲突，阻塞整条迁移链
+- **禁止只加 Model 不加迁移**：Model 和对应的 migration 必须在同一次改动中完成
+- **禁止复制已有迁移文件改内容**：新迁移必须通过命令生成，确保 revision ID 和 down_revision 正确
+
+### 生成失败排查
+
+| 错误 | 原因 | 修复 |
+|------|------|------|
+| `Target database is not up to date` | 数据库版本落后 | 先 `uv run alembic upgrade head` |
+| `Multiple head revisions` | 迁移链分叉 | `uv run alembic merge -m "merge" <rev1> <rev2>` |
+| `Revision xxx is present more than once` | 两个文件共用同一 revision ID | 重命名其中一个文件的 revision（由 `alembic revision` 生成新 ID） |
 
 ## 导入完整性规则
 

@@ -6,6 +6,9 @@ export interface EffectivenessBreakdown {
   user_rating: number
   agent_eval: number
   usage_effect: number
+  task_success_rate: number
+  task_success_count: number
+  task_fail_count: number
   positive_count: number
   negative_count: number
 }
@@ -200,10 +203,10 @@ export const useGeneStore = defineStore('gene', () => {
     }
   }
 
-  async function fetchGene(id: string) {
+  async function fetchGene(slug: string) {
     loading.value = true
     try {
-      const res = await api.get(`/genes/${id}`)
+      const res = await api.get(`/genes/${slug}`)
       currentGene.value = res.data.data
     } catch (e) {
       console.error('fetchGene error:', e)
@@ -212,9 +215,9 @@ export const useGeneStore = defineStore('gene', () => {
     }
   }
 
-  async function fetchGeneVariants(id: string): Promise<GeneItem[]> {
+  async function fetchGeneVariants(slug: string): Promise<GeneItem[]> {
     try {
-      const res = await api.get(`/genes/${id}/variants`)
+      const res = await api.get(`/genes/${slug}/variants`)
       return res.data.data || []
     } catch (e) {
       console.error('fetchGeneVariants error:', e)
@@ -222,9 +225,9 @@ export const useGeneStore = defineStore('gene', () => {
     }
   }
 
-  async function fetchGeneSynergies(id: string): Promise<GeneItem[]> {
+  async function fetchGeneSynergies(slug: string): Promise<GeneItem[]> {
     try {
-      const res = await api.get(`/genes/${id}/synergies`)
+      const res = await api.get(`/genes/${slug}/synergies`)
       return res.data.data || []
     } catch (e) {
       console.error('fetchGeneSynergies error:', e)
@@ -232,9 +235,9 @@ export const useGeneStore = defineStore('gene', () => {
     }
   }
 
-  async function fetchGeneGenomes(id: string): Promise<GenomeItem[]> {
+  async function fetchGeneGenomes(slug: string): Promise<GenomeItem[]> {
     try {
-      const res = await api.get(`/genes/${id}/genomes`)
+      const res = await api.get(`/genes/${slug}/genomes`)
       return res.data.data || []
     } catch (e) {
       console.error('fetchGeneGenomes error:', e)

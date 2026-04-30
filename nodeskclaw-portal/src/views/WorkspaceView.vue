@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { ArrowLeft, Settings, Maximize2, Minimize2, ZoomIn, ZoomOut, RotateCcw, MessageSquare, Plus, Keyboard, ChevronDown, X, Bot, ListChecks, AlertTriangle, Wifi, User, Users, MapPin, Focus, Minimize } from 'lucide-vue-next'
+import { ArrowLeft, Settings, Maximize2, Minimize2, ZoomIn, ZoomOut, RotateCcw, RefreshCw, MessageSquare, Plus, Keyboard, ChevronDown, X, Bot, ListChecks, AlertTriangle, Wifi, User, Users, MapPin, Focus, Minimize } from 'lucide-vue-next'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useAuthStore } from '@/stores/auth'
 import { useViewTransition } from '@/composables/useViewTransition'
@@ -10,14 +10,16 @@ import Workspace3D from '@/components/hex3d/Workspace3D.vue'
 import Workspace2D from '@/components/hex2d/Workspace2D.vue'
 import ModeToggle from '@/components/shared/ModeToggle.vue'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
+import ConversationList from '@/components/chat/ConversationList.vue'
 import LocaleSelect from '@/components/shared/LocaleSelect.vue'
 import BlackboardOverlay from '@/components/blackboard/BlackboardOverlay.vue'
 import HexActionDrawer from '@/components/workspace/HexActionDrawer.vue'
 import AgentCollaborationPanel from '@/components/workspace/AgentCollaborationPanel.vue'
 import AgentDetailDialog from '@/components/workspace/AgentDetailDialog.vue'
-import CollaborationTimeline from '@/components/workspace/CollaborationTimeline.vue'
 import AddAgentDialog from '@/components/workspace/AddAgentDialog.vue'
+import WorkspaceSettings from '@/views/WorkspaceSettings.vue'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import { axialToWorld } from '@/composables/useHexLayout'
 import { getCurrentLocale, setCurrentLocale } from '@/i18n'
 
@@ -28,6 +30,7 @@ const store = useWorkspaceStore()
 const authStore = useAuthStore()
 
 const locale = ref(getCurrentLocale())
+const showSettingsDialog = ref(false)
 function onLocaleChange(value: string) {
   locale.value = setCurrentLocale(value)
 }
@@ -56,9 +59,8 @@ const enrichedTopologyNodes = computed(() =>
 
 const { activeMode, isTransitioning, transitionTo2D, transitionTo3D } = useViewTransition()
 
-const chatOpen = ref(false)
-const chatSidebarTab = ref<'blackboard' | 'collab-flow'>('blackboard')
-const collabTimelineRef = ref<InstanceType<typeof CollaborationTimeline> | null>(null)
+const CHAT_OPEN_KEY = 'workspace-chat-open'
+const chatOpen = ref(localStorage.getItem(CHAT_OPEN_KEY) === 'true')
 const collabPanelOpen = ref(false)
 const collabPanelAgent = ref<{ instanceId: string; name: string } | null>(null)
 const collabPanelRef = ref<InstanceType<typeof AgentCollaborationPanel> | null>(null)
@@ -119,7 +121,8 @@ function toggleFocusMode() {
 
 watch(chatOpen, (v) => {
   store.setChatVisible(v)
-})
+  localStorage.setItem(CHAT_OPEN_KEY, String(v))
+}, { immediate: true })
 
 interface SelectedHex {
   q: number
@@ -224,6 +227,7 @@ async function bootstrapWorkspaceCritical(wsId: string): Promise<number | null> 
 async function bootstrapWorkspaceDeferred(wsId: string, generation: number) {
   await Promise.allSettled([
     store.fetchMembers(wsId),
+    store.fetchConversations(wsId),
     loadPerfSummary(wsId),
   ])
   if (generation !== workspaceBootstrapGeneration) return
@@ -315,6 +319,15 @@ function onSSEEvent(event: string, data: Record<string, unknown>) {
     return
   }
 
+  if (event === 'schedule:consecutive_failures') {
+    const name = typeof data.name === 'string' ? data.name : ''
+    const count = typeof data.consecutive_failures === 'number' ? data.consecutive_failures : 0
+    if (name && count) {
+      toast.warning(t('blackboard.scheduleConsecutiveFailureAlert', { name, count }))
+    }
+    return
+  }
+
   if (event === 'agent:collaboration') {
     const instanceId = data.instance_id as string
     const target = data.target as string
@@ -327,9 +340,6 @@ function onSSEEvent(event: string, data: Record<string, unknown>) {
     }
     if (collabPanelOpen.value && collabPanelRef.value) {
       collabPanelRef.value.addLiveMessage(data)
-    }
-    if (chatSidebarTab.value === 'collab-flow' && collabTimelineRef.value) {
-      collabTimelineRef.value.addLiveMessage(data)
     }
   }
 }
@@ -396,7 +406,7 @@ function onAgentDblClick(_id: string) {
   chatOpen.value = true
 }
 
-function onHexAction(action: string) {
+async function onHexAction(action: string) {
   switch (action) {
     case 'add-agent': {
       const q = selectedHex.value?.q
@@ -430,7 +440,12 @@ function onHexAction(action: string) {
       break
     case 'remove-agent':
       if (selectedHex.value?.agentId) {
-        store.removeAgent(workspaceId.value, selectedHex.value.agentId)
+        try {
+          await store.removeAgent(workspaceId.value, selectedHex.value.agentId)
+          toast.success(t('hexAction.agentRemoved'))
+        } catch {
+          toast.error(t('hexAction.removeFailed'))
+        }
         selectedHex.value = null
         hexDrawerOpen.value = false
         selectedAgentId.value = null
@@ -474,7 +489,12 @@ function onHexAction(action: string) {
       break
     case 'remove-corridor':
       if (selectedHex.value?.entityId) {
-        store.deleteCorridorHex(workspaceId.value, selectedHex.value.entityId)
+        try {
+          await store.deleteCorridorHex(workspaceId.value, selectedHex.value.entityId)
+          toast.success(t('hexAction.corridorRemoved'))
+        } catch {
+          toast.error(t('hexAction.removeFailed'))
+        }
         selectedHex.value = null
         hexDrawerOpen.value = false
       }
@@ -495,7 +515,12 @@ function onHexAction(action: string) {
       break
     case 'remove-human':
       if (selectedHex.value?.entityId) {
-        store.deleteHumanHex(workspaceId.value, selectedHex.value.entityId)
+        try {
+          await store.deleteHumanHex(workspaceId.value, selectedHex.value.entityId)
+          toast.success(t('hexAction.humanRemoved'))
+        } catch {
+          toast.error(t('hexAction.removeFailed'))
+        }
         selectedHex.value = null
         hexDrawerOpen.value = false
       }
@@ -690,6 +715,32 @@ function panCanvas(key: string) {
 
 // ── Move Mode ────────────────────────────────────────
 const toast = useToast()
+const { confirm } = useConfirm()
+
+const restartingAll = ref(false)
+const hasRestartableAgents = computed(() => agents.value.some(a => a.status === 'running' || a.status === 'learning'))
+
+async function handleRestartAll() {
+  const ok = await confirm({
+    title: t('workspaceView.restartAll'),
+    description: t('workspaceView.restartAllConfirm'),
+    variant: 'danger',
+  })
+  if (!ok) return
+  restartingAll.value = true
+  try {
+    const result = await store.restartAllInstances(workspaceId.value)
+    if (result.failed > 0) {
+      toast.warning(t('workspaceView.restartAllPartial', { succeeded: result.succeeded, failed: result.failed }))
+    } else {
+      toast.success(t('workspaceView.restartAllSuccess', { succeeded: result.succeeded }))
+    }
+  } catch (e: any) {
+    toast.error(e?.response?.data?.detail?.message || t('workspaceView.restartAllFailed'))
+  } finally {
+    restartingAll.value = false
+  }
+}
 
 type MovingHexSource = {
   type: 'agent' | 'corridor' | 'human'
@@ -883,6 +934,18 @@ function handleKeydown(e: KeyboardEvent) {
       </div>
 
       <div class="flex items-center gap-2">
+        <button
+          v-if="store.hasPermission('manage_agents')"
+          class="p-1.5 rounded-lg hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          :title="hasRestartableAgents ? t('workspaceView.restartAll') : t('workspaceView.restartAllNoInstances')"
+          :disabled="restartingAll || !hasRestartableAgents"
+          @click="handleRestartAll"
+        >
+          <RefreshCw class="w-4 h-4" :class="{ 'animate-spin': restartingAll }" />
+        </button>
+
+        <div v-if="store.hasPermission('manage_agents')" class="w-px h-5 bg-border" />
+
         <div class="flex items-center gap-0.5 mr-1">
           <button class="p-1.5 rounded-lg hover:bg-muted transition-colors" :title="t('workspaceView.zoomIn')" @click="handleZoomIn">
             <ZoomIn class="w-4 h-4" />
@@ -920,7 +983,7 @@ function handleKeydown(e: KeyboardEvent) {
         <button
           v-if="store.hasPermission('manage_settings')"
           class="p-1.5 rounded-lg hover:bg-muted transition-colors"
-          @click="router.push(`/workspace/${workspaceId}/settings`)"
+          @click="showSettingsDialog = true"
         >
           <Settings class="w-4 h-4" />
         </button>
@@ -1094,25 +1157,9 @@ function handleKeydown(e: KeyboardEvent) {
           </div>
           <div class="flex flex-col flex-1 min-w-0 min-h-0">
             <div class="flex items-center justify-between px-4 py-2 border-b border-border shrink-0">
+              <span class="text-xs font-medium text-foreground">{{ t('workspaceView.conversationList') }}</span>
               <div class="flex items-center gap-1">
                 <button
-                  class="px-2.5 py-1 text-xs rounded-md transition-colors"
-                  :class="chatSidebarTab === 'blackboard' ? 'bg-primary/15 text-primary font-medium' : 'text-muted-foreground hover:text-foreground'"
-                  @click="chatSidebarTab = 'blackboard'"
-                >
-                  {{ t('workspaceView.centralBlackboardChat') }}
-                </button>
-                <button
-                  class="px-2.5 py-1 text-xs rounded-md transition-colors"
-                  :class="chatSidebarTab === 'collab-flow' ? 'bg-violet-500/15 text-violet-400 font-medium' : 'text-muted-foreground hover:text-foreground'"
-                  @click="chatSidebarTab = 'collab-flow'"
-                >
-                  {{ t('workspaceView.collabFlow') }}
-                </button>
-              </div>
-              <div class="flex items-center gap-1">
-                <button
-                  v-if="chatSidebarTab === 'blackboard'"
                   class="p-1 rounded hover:bg-muted transition-colors"
                   :title="focusMode ? t('workspaceView.exitFocus') : t('workspaceView.enterFocus')"
                   @click="toggleFocusMode"
@@ -1128,19 +1175,18 @@ function handleKeydown(e: KeyboardEvent) {
                 </button>
               </div>
             </div>
-            <ChatPanel
-              v-if="chatSidebarTab === 'blackboard'"
+            <ConversationList
               :workspace-id="workspaceId"
+              :conversations="store.conversations"
+              :active-id="store.activeConversationId"
+              class="shrink-0"
+              @select="store.activeConversationId = $event"
+            />
+            <ChatPanel
+              :workspace-id="workspaceId"
+              :conversation-id="store.activeConversationId || undefined"
               :can-send="store.hasPermission('send_chat')"
               class="flex-1 min-h-0"
-            />
-            <CollaborationTimeline
-              v-else
-              ref="collabTimelineRef"
-              :workspace-id="workspaceId"
-              :agents="agents"
-              class="flex-1 min-h-0"
-              @replay-flow="onReplayFlow"
             />
           </div>
         </div>
@@ -1314,7 +1360,7 @@ function handleKeydown(e: KeyboardEvent) {
               <p class="text-sm text-muted-foreground">{{ t('hexAction.noAvailableMembers') }}</p>
               <button
                 class="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm hover:bg-primary/90 transition-colors"
-                @click="showMemberPicker = false; router.push(`/workspace/${workspaceId}/settings`)"
+                @click="showMemberPicker = false; showSettingsDialog = true"
               >
                 {{ t('hexAction.goToSettings') }}
               </button>
@@ -1450,7 +1496,14 @@ function handleKeydown(e: KeyboardEvent) {
       :workspace-id="workspaceId"
       :target-hex-q="addAgentHexQ"
       :target-hex-r="addAgentHexR"
+      :cluster-id="store.currentWorkspace?.cluster_id"
       @added="onAgentAdded"
+    />
+
+    <WorkspaceSettings
+      v-model:open="showSettingsDialog"
+      :workspace-id="workspaceId"
+      @deleted="router.push('/')"
     />
   </div>
 </template>

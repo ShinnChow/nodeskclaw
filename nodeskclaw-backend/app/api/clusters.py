@@ -1,21 +1,21 @@
-"""Cluster management endpoints."""
+"""Cluster management endpoints (Admin — platform-level, no org filtering)."""
+
+import logging
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import hooks
-from app.core.deps import get_current_org, get_db
-from app.core.exceptions import NotFoundError
+from app.core.deps import get_db
 from app.core.security import get_current_user
-from app.models.cluster import Cluster
 from app.models.user import User
 from app.schemas.cluster import ClusterCreate, ClusterInfo, ClusterUpdate, ConnectionTestResult
 from app.schemas.common import ApiResponse
 from app.services import cluster_service
 from app.services.runtime.registries.compute_registry import require_k8s_client
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -24,7 +24,6 @@ async def list_clusters(
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """集群列表。"""
     data = await cluster_service.list_clusters(db)
     return ApiResponse(data=data)
 
@@ -33,12 +32,10 @@ async def list_clusters(
 async def create_cluster(
     body: ClusterCreate,
     db: AsyncSession = Depends(get_db),
-    org_ctx=Depends(get_current_org),
+    current_user: User = Depends(get_current_user),
 ):
-    """添加集群（K8s / Docker / 未来扩展类型）。"""
-    current_user, org = org_ctx
-    data = await cluster_service.create_cluster(body, current_user, db, org_id=org.id)
-    await hooks.emit("operation_audit", action="cluster.created", target_type="cluster", target_id=data.id, actor_id=current_user.id, org_id=org.id)
+    data = await cluster_service.create_cluster(body, current_user, db, org_id=current_user.current_org_id)
+    await hooks.emit("operation_audit", action="cluster.created", target_type="cluster", target_id=data.id, actor_id=current_user.id, org_id=current_user.current_org_id)
     return ApiResponse(data=data)
 
 
@@ -48,7 +45,6 @@ async def get_cluster(
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """集群详情。"""
     cluster = await cluster_service.get_cluster(cluster_id, db)
     return ApiResponse(data=ClusterInfo.model_validate(cluster))
 
@@ -58,11 +54,10 @@ async def update_cluster(
     cluster_id: str,
     body: ClusterUpdate,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    """更新集群配置。"""
     data = await cluster_service.update_cluster(cluster_id, body, db)
-    await hooks.emit("operation_audit", action="cluster.updated", target_type="cluster", target_id=cluster_id, actor_id=_current_user.id, org_id=_current_user.current_org_id)
+    await hooks.emit("operation_audit", action="cluster.updated", target_type="cluster", target_id=cluster_id, actor_id=current_user.id, org_id=current_user.current_org_id)
     return ApiResponse(data=data)
 
 
@@ -70,11 +65,10 @@ async def update_cluster(
 async def delete_cluster(
     cluster_id: str,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    """删除集群。"""
     await cluster_service.delete_cluster(cluster_id, db)
-    await hooks.emit("operation_audit", action="cluster.deleted", target_type="cluster", target_id=cluster_id, actor_id=_current_user.id, org_id=_current_user.current_org_id)
+    await hooks.emit("operation_audit", action="cluster.deleted", target_type="cluster", target_id=cluster_id, actor_id=current_user.id, org_id=current_user.current_org_id)
     return ApiResponse(message="集群已删除")
 
 
@@ -84,7 +78,6 @@ async def cluster_health(
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """集群健康详情 + Token 过期检测。"""
     from app.services.health_checker import get_cluster_health
 
     data = await get_cluster_health(cluster_id, db)
@@ -97,13 +90,7 @@ async def cluster_overview(
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """集群概览: 资源汇总 + 节点列表。"""
-    result = await db.execute(
-        select(Cluster).where(Cluster.id == cluster_id, Cluster.deleted_at.is_(None))
-    )
-    cluster = result.scalar_one_or_none()
-    if not cluster:
-        raise NotFoundError("集群不存在")
+    cluster = await cluster_service.get_cluster(cluster_id, db)
 
     k8s = await require_k8s_client(cluster)
 
@@ -120,12 +107,15 @@ async def cluster_overview(
         sc_list = await storage_api.list_storage_class()
 
         allowed_raw = await get_config("allowed_storage_classes", db)
-        allowed_names: set[str] = set()
-        if allowed_raw:
+        if allowed_raw is None:
+            all_allowed = True
+            allowed_names: set[str] = set()
+        else:
+            all_allowed = False
             try:
                 allowed_names = set(_json.loads(allowed_raw))
             except (_json.JSONDecodeError, TypeError):
-                pass
+                allowed_names = set()
 
         for sc in sc_list.items:
             ann = sc.metadata.annotations or {}
@@ -136,12 +126,11 @@ async def cluster_overview(
                 "reclaim_policy": sc.reclaim_policy,
                 "allow_volume_expansion": sc.allow_volume_expansion or False,
                 "is_default": is_default,
-                "enabled": sc.metadata.name in allowed_names,
+                "enabled": all_allowed or sc.metadata.name in allowed_names,
             })
     except Exception:
-        pass  # StorageClass 获取失败不影响概览
+        logger.warning("Failed to list StorageClasses for cluster %s", cluster_id, exc_info=True)
 
-    # 获取 IngressClass 列表
     ingress_classes = []
     try:
         from kubernetes_asyncio.client import NetworkingV1Api
@@ -154,7 +143,7 @@ async def cluster_overview(
                 "controller": ic.spec.controller if ic.spec else "",
             })
     except Exception:
-        pass
+        logger.warning("Failed to list IngressClasses for cluster %s", cluster_id, exc_info=True)
 
     return ApiResponse(data={
         "summary": summary,
@@ -170,7 +159,6 @@ async def test_connection(
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """测试集群连接。"""
     data = await cluster_service.test_connection(cluster_id, db)
     return ApiResponse(data=data)
 
@@ -184,9 +172,8 @@ async def update_kubeconfig(
     cluster_id: str,
     body: KubeconfigBody,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    """更新 KubeConfig（重建连接）。"""
     data = await cluster_service.update_kubeconfig(cluster_id, body.kubeconfig, db)
-    await hooks.emit("operation_audit", action="cluster.kubeconfig_updated", target_type="cluster", target_id=cluster_id, actor_id=_current_user.id, org_id=_current_user.current_org_id)
+    await hooks.emit("operation_audit", action="cluster.kubeconfig_updated", target_type="cluster", target_id=cluster_id, actor_id=current_user.id, org_id=current_user.current_org_id)
     return ApiResponse(data=data)

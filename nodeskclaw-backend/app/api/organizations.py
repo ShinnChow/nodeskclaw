@@ -1,5 +1,7 @@
 """Organization management endpoints."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,8 +23,8 @@ from app.models.user import User
 from app.schemas.common import ApiResponse
 from app.schemas.organization import (
     AddMemberRequest,
+    CollaborationDepthUpdate,
     MemberInfo,
-    OAuthOrgSetupRequest,
     OrgCreate,
     OrgInfo,
     OrgNameUpdate,
@@ -32,6 +34,7 @@ from app.schemas.organization import (
 )
 from app.services import auth_service, org_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -127,6 +130,28 @@ async def update_current_org_name(
     return ApiResponse(data=data)
 
 
+@router.put("/current/collaboration-depth", response_model=ApiResponse[OrgInfo])
+async def update_current_org_collaboration_depth(
+    body: CollaborationDepthUpdate,
+    db: AsyncSession = Depends(get_db),
+    org_ctx: tuple = Depends(require_org_admin),
+):
+    """组织管理员修改当前组织的最大协作深度。"""
+    _user, org = org_ctx
+    await org_service.update_org(
+        org.id, OrgUpdate(max_collaboration_depth=body.max_collaboration_depth), db,
+    )
+    await db.refresh(org)
+    data = await _enrich_org_info(org, db)
+    await hooks.emit(
+        "operation_audit", action="org.collaboration_depth_updated",
+        target_type="organization", target_id=org.id,
+        actor_id=_user.id, org_id=org.id,
+        details={"max_collaboration_depth": body.max_collaboration_depth},
+    )
+    return ApiResponse(data=data)
+
+
 @router.post("/switch/{org_id}", response_model=ApiResponse[OrgInfo],
              dependencies=[Depends(require_feature("multi_org"))])
 async def switch_organization(
@@ -176,32 +201,6 @@ async def delete_organization(
     await org_service.delete_org(org_id, db)
     await hooks.emit("operation_audit", action="org.deleted", target_type="organization", target_id=org_id, actor_id=_admin.id, org_id=org_id)
     return ApiResponse(message="组织已删除")
-
-
-# ── OAuth 自助开通 ─────────────────────────────────────────
-
-@router.post("/oauth-setup", response_model=ApiResponse[OrgInfo])
-async def oauth_org_setup(
-    body: OAuthOrgSetupRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """OAuth 登录后首次开通组织：创建组织并绑定 OAuth 租户。"""
-    data = await org_service.oauth_org_setup(current_user, body, db)
-    return ApiResponse(data=data)
-
-
-@router.post("/feishu-setup", response_model=ApiResponse[OrgInfo])
-async def feishu_org_setup(
-    body: OAuthOrgSetupRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """飞书开通组织（向后兼容别名）。"""
-    if not body.provider:
-        body.provider = "feishu"
-    data = await org_service.oauth_org_setup(current_user, body, db)
-    return ApiResponse(data=data)
 
 
 # ── 成员管理 ─────────────────────────────────────────────
@@ -266,7 +265,7 @@ async def remove_member(
         try:
             await get_member_hook().on_member_removed(org_id, removed_user_id)
         except Exception:
-            pass
+            logger.exception("on_member_removed hook failed for org=%s user=%s", org_id, removed_user_id)
     return ApiResponse(message="成员已移除")
 
 
@@ -336,8 +335,10 @@ async def org_akr_summary(
 ):
     """Aggregate AKR data across all workspaces in the org."""
     from app.models.workspace import Workspace
+    from app.models.workspace_agent import WorkspaceAgent
     from app.models.workspace_objective import WorkspaceObjective
     from app.models.workspace_task import WorkspaceTask
+    from app.models.llm_usage_log import LlmUsageLog
 
     ws_rows = (await db.execute(
         select(Workspace.id, Workspace.name).where(
@@ -366,14 +367,29 @@ async def org_akr_summary(
         )
     )).scalars().all()
 
+    token_rows = (await db.execute(
+        select(
+            WorkspaceAgent.workspace_id,
+            func.coalesce(func.sum(LlmUsageLog.total_tokens), 0),
+        )
+        .join(LlmUsageLog, LlmUsageLog.instance_id == WorkspaceAgent.instance_id)
+        .where(
+            WorkspaceAgent.workspace_id.in_(ws_ids),
+            WorkspaceAgent.deleted_at.is_(None),
+        )
+        .group_by(WorkspaceAgent.workspace_id)
+    )).all()
+    token_by_ws = {r[0]: int(r[1]) for r in token_rows}
+
     workspaces = []
     for ws_id in ws_ids:
         ws_objs = [o for o in objectives if o.workspace_id == ws_id]
         ws_tasks = [t for t in tasks if t.workspace_id == ws_id]
         total_t = len(ws_tasks)
         done_t = sum(1 for t in ws_tasks if t.status in ("done", "archived"))
+        failed_t = sum(1 for t in ws_tasks if t.status == "failed")
         total_value = sum(t.actual_value or 0 for t in ws_tasks if t.status in ("done", "archived"))
-        total_tokens = sum(t.token_cost or 0 for t in ws_tasks)
+        total_tokens = token_by_ws.get(ws_id, 0)
         roi = total_value / total_tokens * 1000 if total_tokens > 0 else 0.0
 
         obj_summaries = []
@@ -391,6 +407,7 @@ async def org_akr_summary(
             "objectives": obj_summaries,
             "total_tasks": total_t,
             "completed_tasks": done_t,
+            "failed_tasks": failed_t,
             "completion_rate": round(done_t / total_t, 4) if total_t > 0 else 0.0,
             "total_value": round(total_value, 2),
             "total_tokens": total_tokens,

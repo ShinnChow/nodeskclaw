@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import re
+import uuid
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from app.services.docker_constants import DOCKER_DATA_DIR
+from app.services.docker_constants import DOCKER_DATA_DIR, DOCKER_HOST_DATA_DIR
 from app.services.runtime.compute.base import (
     ComputeHandle,
     InstanceComputeConfig,
@@ -17,6 +19,7 @@ from app.services.runtime.compute.base import (
 logger = logging.getLogger(__name__)
 
 _LOCALHOST_RE = re.compile(r"(https?://)(localhost|127\.0\.0\.1)(:\d+)?")
+_WINDOWS_HOST_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def _docker_endpoint_host() -> str:
@@ -55,6 +58,130 @@ def _parse_mem(mem_str: str) -> str:
     raise ValueError(f"Unsupported memory unit: {mem_str!r}")
 
 
+def _extract_docker_error(stderr_text: str) -> str:
+    """Extract the meaningful error from docker compose stderr, stripping progress noise."""
+    marker = "Error response from daemon:"
+    idx = stderr_text.find(marker)
+    if idx != -1:
+        return stderr_text[idx:].strip()[:500]
+    idx2 = stderr_text.rfind("Error")
+    if idx2 != -1:
+        return stderr_text[idx2:].strip()[:500]
+    return stderr_text.strip()[:500]
+
+
+def _is_windows_path(path: str) -> bool:
+    return bool(_WINDOWS_HOST_PATH_RE.match(path))
+
+
+def _join_host_path(base: str, *parts: str) -> str:
+    if _is_windows_path(base):
+        return str(PureWindowsPath(base, *parts))
+    return str(PurePosixPath(base, *parts))
+
+
+def _pure_host_path(path: str) -> PureWindowsPath | PurePosixPath:
+    if _is_windows_path(path):
+        return PureWindowsPath(path)
+    return PurePosixPath(path)
+
+
+def _compose_path_for_slug(slug: str) -> str:
+    return str(DOCKER_DATA_DIR / slug / "docker-compose.yml")
+
+
+def _remap_legacy_compose_path(stored_path: str) -> str:
+    if not stored_path:
+        return ""
+
+    try:
+        rel = _pure_host_path(stored_path).relative_to(_pure_host_path(DOCKER_HOST_DATA_DIR))
+    except ValueError:
+        return ""
+
+    return str(DOCKER_DATA_DIR.joinpath(*rel.parts))
+
+
+def _resolve_compose_path(slug: str, stored_path: str) -> str:
+    current_path = _compose_path_for_slug(slug)
+    if os.path.exists(current_path):
+        return current_path
+
+    remapped_path = _remap_legacy_compose_path(stored_path)
+    if remapped_path and os.path.exists(remapped_path):
+        return remapped_path
+
+    if stored_path and os.path.exists(stored_path):
+        return stored_path
+
+    return current_path
+
+
+async def _seed_template_from_image(config: InstanceComputeConfig, data_dir: Path) -> None:
+    """从镜像中提取配置模板到宿主机 data 目录（仅首次部署时需要）。
+
+    Docker Compose 部署时，空目录 bind mount 到容器的 data_dir 会遮盖镜像内
+    预置的模板文件。此处通过 docker create + cp 从镜像提取模板，确保 entrypoint
+    首次启动时能正确生成 openclaw.json。
+    """
+    from app.services.runtime.registries.runtime_registry import RUNTIME_REGISTRY
+    rt_spec = RUNTIME_REGISTRY.get(config.runtime)
+    if not rt_spec:
+        return
+
+    template_rel = rt_spec.docker_seed_template_rel
+    if not template_rel:
+        return
+
+    container_data_dir = rt_spec.data_dir_container_path
+    host_template = data_dir / template_rel
+
+    # 已存在则跳过（已有实例或已迁移数据）
+    if host_template.exists():
+        return
+
+    image = config.env_vars.get("DOCKER_IMAGE", f"deskclaw:{config.image_version}")
+    tmp_container = f"tmpl-seed-{config.slug}-{uuid.uuid4().hex[:8]}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "create", "--platform", "linux/amd64", "--name", tmp_container, image,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning("seed_template: docker create failed: %s", stderr.decode().strip()[:300])
+            return
+        container_id = stdout.decode().strip()
+        if not container_id:
+            logger.warning("seed_template: docker create returned empty id for %s", config.slug)
+            return
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "cp",
+                f"{container_id}:{container_data_dir}/{template_rel}",
+                str(host_template),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, cp_stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning("seed_template: docker cp failed: %s", cp_stderr.decode().strip()[:300])
+                return
+            logger.info("seed_template: copied %s from %s to %s", template_rel, image, host_template)
+        finally:
+            rm_proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", container_id,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await rm_proc.wait()
+    except Exception:
+        logger.warning("seed_template: unexpected error for %s", config.slug, exc_info=True)
+
+
 def _build_compose_yaml(config: InstanceComputeConfig) -> dict:
     """Generate a docker-compose service definition with full resource config."""
     env = {
@@ -66,24 +193,40 @@ def _build_compose_yaml(config: InstanceComputeConfig) -> dict:
     from app.services.runtime.registries.runtime_registry import RUNTIME_REGISTRY
     rt_spec = RUNTIME_REGISTRY.get(config.runtime)
     container_data_dir = rt_spec.data_dir_container_path if rt_spec else "/root/.openclaw"
+    host_data_dir = _join_host_path(DOCKER_HOST_DATA_DIR, config.slug, "data")
 
     main_service: dict = {
         "image": env.get("DOCKER_IMAGE", f"deskclaw:{config.image_version}"),
         "container_name": config.slug,
         "environment": env,
         "ports": [f"{host_port}:{config.gateway_port}"],
-        "volumes": [f"{DOCKER_DATA_DIR / config.slug / 'data'}:{container_data_dir}"],
+        "volumes": [{
+            "type": "bind",
+            "source": host_data_dir,
+            "target": container_data_dir,
+        }],
         "restart": "unless-stopped",
         "platform": "linux/amd64",
         "networks": [f"{config.slug}-net"],
         "extra_hosts": ["host.docker.internal:host-gateway"],
     }
 
+    if rt_spec and rt_spec.docker_command:
+        main_service["command"] = list(rt_spec.docker_command)
+
     if config.mem_limit:
         main_service["mem_limit"] = _parse_mem(config.mem_limit)
     if config.cpu_limit:
         try:
-            main_service["cpus"] = _parse_cpu(config.cpu_limit)
+            parsed = _parse_cpu(config.cpu_limit)
+            available = os.cpu_count() or 1
+            if parsed <= available:
+                main_service["cpus"] = parsed
+            else:
+                logger.warning(
+                    "requested cpus %.2f exceeds available %d, skipping cpu limit",
+                    parsed, available,
+                )
         except (ValueError, TypeError):
             pass
 
@@ -125,8 +268,11 @@ class DockerComputeProvider:
         data_dir = DOCKER_DATA_DIR / config.slug / "data"
         os.makedirs(str(data_dir), exist_ok=True)
 
+        # 从镜像中提取模板文件到宿主机 data 目录，确保 entrypoint 首次启动能生成配置
+        await _seed_template_from_image(config, data_dir)
+
         compose = _build_compose_yaml(config)
-        compose_path = os.path.join(project_dir, "docker-compose.yml")
+        compose_path = _compose_path_for_slug(config.slug)
 
         try:
             import yaml
@@ -144,9 +290,9 @@ class DockerComputeProvider:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                error_msg = stderr.decode()[:500]
-                logger.error("docker compose up failed: %s", error_msg)
-                raise RuntimeError(f"docker compose up 失败: {error_msg}")
+                raw = stderr.decode()
+                logger.error("docker compose up failed: %s", raw)
+                raise RuntimeError(f"docker compose up 失败: {_extract_docker_error(raw)}")
         except FileNotFoundError:
             raise RuntimeError("docker compose 未安装")
 
@@ -163,7 +309,8 @@ class DockerComputeProvider:
 
     async def destroy_instance(self, handle: ComputeHandle, **kwargs) -> None:
         logger.info("DockerComputeProvider.destroy_instance: %s", handle.instance_id)
-        compose_path = handle.extra.get("compose_path", "")
+        slug = handle.extra.get("slug", handle.instance_id)
+        compose_path = _resolve_compose_path(slug, handle.extra.get("compose_path", ""))
         if compose_path and os.path.exists(compose_path):
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -171,9 +318,37 @@ class DockerComputeProvider:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                await proc.communicate()
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    return
+                logger.warning("docker compose down failed: %s", stderr.decode().strip()[:300])
             except Exception as e:
                 logger.warning("docker compose down failed: %s", e)
+
+        for container_name in (f"{slug}-companion", slug):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "rm", "-f", container_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0 and "No such container" not in stderr.decode():
+                    logger.warning("docker rm failed for %s: %s", container_name, stderr.decode().strip()[:300])
+            except Exception as e:
+                logger.warning("docker rm failed for %s: %s", container_name, e)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "network", "rm", f"{slug}-net",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 and "No such network" not in stderr.decode():
+                logger.warning("docker network rm failed for %s-net: %s", slug, stderr.decode().strip()[:300])
+        except Exception as e:
+            logger.warning("docker network rm failed for %s-net: %s", slug, e)
 
     async def get_status(self, handle: ComputeHandle) -> str:
         slug = handle.extra.get("slug", handle.instance_id)
@@ -189,7 +364,7 @@ class DockerComputeProvider:
                 status_map = {"running": "running", "exited": "stopped", "paused": "stopped"}
                 return status_map.get(status, status)
         except Exception:
-            pass
+            logger.warning("docker inspect failed for slug=%s", slug, exc_info=True)
         return "unknown"
 
     async def get_endpoint(self, handle: ComputeHandle) -> str:
@@ -216,7 +391,8 @@ class DockerComputeProvider:
         return await self.create_instance(config)
 
     async def restart_instance(self, handle: ComputeHandle) -> None:
-        compose_path = handle.extra.get("compose_path", "")
+        slug = handle.extra.get("slug", handle.instance_id)
+        compose_path = _resolve_compose_path(slug, handle.extra.get("compose_path", ""))
         if compose_path and os.path.exists(compose_path):
             proc = await asyncio.create_subprocess_exec(
                 "docker", "compose", "-f", compose_path, "restart",
@@ -225,9 +401,8 @@ class DockerComputeProvider:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                raise RuntimeError(f"docker compose restart 失败: {stderr.decode()[:300]}")
+                raise RuntimeError(f"docker compose restart 失败: {_extract_docker_error(stderr.decode())}")
         else:
-            slug = handle.extra.get("slug", handle.instance_id)
             proc = await asyncio.create_subprocess_exec(
                 "docker", "restart", slug,
                 stdout=asyncio.subprocess.PIPE,
@@ -235,10 +410,11 @@ class DockerComputeProvider:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                raise RuntimeError(f"docker restart 失败: {stderr.decode()[:300]}")
+                raise RuntimeError(f"docker restart 失败: {_extract_docker_error(stderr.decode())}")
 
     async def scale_instance(self, handle: ComputeHandle, replicas: int) -> ComputeHandle:
-        compose_path = handle.extra.get("compose_path", "")
+        slug = handle.extra.get("slug", handle.instance_id)
+        compose_path = _resolve_compose_path(slug, handle.extra.get("compose_path", ""))
         if compose_path and os.path.exists(compose_path):
             proc = await asyncio.create_subprocess_exec(
                 "docker", "compose", "-f", compose_path, "up", "-d",
@@ -248,7 +424,7 @@ class DockerComputeProvider:
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                raise RuntimeError(f"docker compose scale 失败: {stderr.decode()[:300]}")
+                raise RuntimeError(f"docker compose scale 失败: {_extract_docker_error(stderr.decode())}")
         handle.extra["replicas"] = replicas
         return handle
 
@@ -269,4 +445,9 @@ class DockerComputeProvider:
             return {"healthy": True, "detail": "container running (no http probe)"}
 
         from app.services.runtime.compute.base import http_probe
-        return await http_probe(handle.endpoint, path=probe_path)
+        endpoint = handle.endpoint
+        if endpoint:
+            host = _docker_endpoint_host()
+            if host != "localhost":
+                endpoint = endpoint.replace("localhost", host).replace("127.0.0.1", host)
+        return await http_probe(endpoint, path=probe_path)

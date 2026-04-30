@@ -1,16 +1,19 @@
 """Gene Evolution Ecosystem service: CRUD, install/learn engine, rating, evolution."""
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Coroutine
+from urllib.parse import urlencode
 
-import httpx
-from sqlalchemy import Integer, Select, and_, case, cast, func, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_nodeskclaw_webhook_base_url, settings
 from app.core.exceptions import AppException, BadRequestError, ConflictError, NotFoundError
 from app.models.base import not_deleted
 from app.models.corridor import HumanHex
@@ -110,6 +113,32 @@ def _json_dumps(obj) -> str | None:
     if obj is None:
         return None
     return json.dumps(obj, ensure_ascii=False)
+
+
+def _gene_callback_secret() -> str:
+    return settings.GENE_CALLBACK_SECRET or settings.JWT_SECRET
+
+
+def sign_gene_callback(task_id: str, instance_id: str, mode: str) -> str:
+    payload = f"{task_id}:{instance_id}:{mode}"
+    return hmac.new(
+        _gene_callback_secret().encode(),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_gene_callback_signature(payload: LearningCallbackPayload, mode: str, sig: str) -> bool:
+    expected = sign_gene_callback(payload.task_id, payload.instance_id, mode)
+    return hmac.compare_digest(expected, sig)
+
+
+def build_gene_callback_url(base_url: str, path: str, task_id: str, instance_id: str, mode: str) -> str:
+    params = urlencode({
+        "instance_id": instance_id,
+        "sig": sign_gene_callback(task_id, instance_id, mode),
+    })
+    return f"{base_url}{path}?{params}"
 
 
 def _truncate_text(text: str, limit: int = 120) -> str:
@@ -525,17 +554,19 @@ async def list_genes(
     return items, result.total
 
 
-async def get_gene(db: AsyncSession, gene_id: str) -> dict:
-    result = await db.execute(
-        select(Gene).where(Gene.id == gene_id, not_deleted(Gene))
-    )
-    gene = result.scalar_one_or_none()
-    if not gene:
+async def get_gene(db: AsyncSession, slug: str) -> dict:
+    aggregator = get_aggregator()
+    detail = await aggregator.get_skill(slug)
+    if not detail:
         raise NotFoundError("基因不存在")
 
-    data = _gene_to_dict(gene)
+    data = _registry_item_to_dict(detail)
 
-    data["effectiveness_breakdown"] = await _get_effectiveness_breakdown(db, gene_id, gene.avg_rating)
+    if detail.source_registry == "local" and detail.local_id:
+        data["effectiveness_breakdown"] = await _get_effectiveness_breakdown(
+            db, detail.local_id, detail.avg_rating
+        )
+
     return data
 
 
@@ -592,27 +623,27 @@ async def get_featured_genes(db: AsyncSession, limit: int = 10) -> list[dict]:
     return [_registry_item_to_dict(item) for item in items]
 
 
-async def get_gene_variants(db: AsyncSession, gene_id: str) -> list[dict]:
+async def get_gene_variants(db: AsyncSession, slug: str) -> list[dict]:
+    gene = await get_gene_by_slug(db, slug)
+    if not gene:
+        return []
     result = await db.execute(
         select(Gene)
-        .where(Gene.parent_gene_id == gene_id, not_deleted(Gene), Gene.is_published.is_(True))
+        .where(Gene.parent_gene_id == gene.id, not_deleted(Gene), Gene.is_published.is_(True))
         .order_by(Gene.effectiveness_score.desc())
     )
     return [_gene_to_dict(g) for g in result.scalars().all()]
 
 
-async def get_gene_synergies(db: AsyncSession, gene_id: str) -> list[dict]:
-    gene = await db.execute(
-        select(Gene).where(Gene.id == gene_id, not_deleted(Gene))
-    )
-    gene_obj = gene.scalar_one_or_none()
-    if not gene_obj:
-        return []
-
+async def get_gene_synergies(db: AsyncSession, slug: str) -> list[dict]:
     aggregator = get_aggregator()
-    agg_synergies = await aggregator.get_synergies(gene_obj.slug)
+    agg_synergies = await aggregator.get_synergies(slug)
     if agg_synergies is not None:
         return agg_synergies
+
+    gene_obj = await get_gene_by_slug(db, slug)
+    if not gene_obj:
+        return []
 
     slugs = _json_loads(gene_obj.synergies) or []
     if not slugs:
@@ -624,22 +655,15 @@ async def get_gene_synergies(db: AsyncSession, gene_id: str) -> list[dict]:
     return [_gene_to_dict(g) for g in result.scalars().all()]
 
 
-async def get_gene_genomes(db: AsyncSession, gene_id: str) -> list[dict]:
+async def get_gene_genomes(db: AsyncSession, slug: str) -> list[dict]:
     """返回包含该基因的所有基因组（通过 gene_slugs JSON 数组匹配）。"""
-    gene = await db.execute(
-        select(Gene).where(Gene.id == gene_id, not_deleted(Gene))
-    )
-    gene_obj = gene.scalar_one_or_none()
-    if not gene_obj:
-        return []
-
     result = await db.execute(
         select(Genome).where(not_deleted(Genome), Genome.is_published.is_(True))
     )
     matched = []
     for g in result.scalars().all():
-        slugs = _json_loads(g.gene_slugs) or []
-        if gene_obj.slug in slugs:
+        gene_slugs = _json_loads(g.gene_slugs) or []
+        if slug in gene_slugs:
             matched.append(_genome_to_dict(g))
     return await _enrich_genomes_tool_counts(db, matched)
 
@@ -716,11 +740,18 @@ async def get_featured_genomes(db: AsyncSession, limit: int = 10) -> list[dict]:
 # ═══════════════════════════════════════════════════
 
 
-async def get_instance_genes(db: AsyncSession, instance_id: str) -> list[dict]:
+async def get_instance_genes(db: AsyncSession, instance_id: str, org_id: str | None = None) -> list[dict]:
+    from app.services.instance_service import get_instance
+
+    await get_instance(instance_id, db, org_id)
     q = (
         select(InstanceGene, Gene)
         .join(Gene, InstanceGene.gene_id == Gene.id)
-        .where(InstanceGene.instance_id == instance_id, not_deleted(InstanceGene))
+        .where(
+            InstanceGene.instance_id == instance_id,
+            not_deleted(InstanceGene),
+            Gene.deleted_at.is_(None),
+        )
         .order_by(InstanceGene.created_at.desc())
     )
     result = await db.execute(q)
@@ -801,7 +832,7 @@ def _build_db_only_items(ig_rows: list) -> list[dict]:
     return items
 
 
-async def get_instance_skills(db: AsyncSession, instance_id: str) -> list[dict]:
+async def get_instance_skills(db: AsyncSession, instance_id: str, org_id: str | None = None) -> list[dict]:
     """Return the merged skill list driven by Pod filesystem + DB enrichment.
 
     Each item is typed ``hub`` (matched Gene Hub entry) or ``emerged``
@@ -812,12 +843,16 @@ async def get_instance_skills(db: AsyncSession, instance_id: str) -> list[dict]:
     """
     from app.services.instance_service import get_instance
 
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     ig_result = await db.execute(
         select(InstanceGene, Gene)
         .join(Gene, InstanceGene.gene_id == Gene.id)
-        .where(InstanceGene.instance_id == instance_id, not_deleted(InstanceGene))
+        .where(
+            InstanceGene.instance_id == instance_id,
+            not_deleted(InstanceGene),
+            Gene.deleted_at.is_(None),
+        )
     )
     ig_rows = ig_result.all()
 
@@ -930,11 +965,14 @@ async def get_instance_skills(db: AsyncSession, instance_id: str) -> list[dict]:
     return items
 
 
-async def get_gene_installed_instance_ids(db: AsyncSession, gene_id: str) -> list[str]:
+async def get_gene_installed_instance_ids(db: AsyncSession, slug: str) -> list[str]:
     """Return instance IDs where this gene is currently installed."""
+    gene = await get_gene_by_slug(db, slug)
+    if not gene:
+        return []
     result = await db.execute(
         select(InstanceGene.instance_id).where(
-            InstanceGene.gene_id == gene_id,
+            InstanceGene.gene_id == gene.id,
             InstanceGene.status == InstanceGeneStatus.installed,
             not_deleted(InstanceGene),
         )
@@ -952,6 +990,7 @@ async def _has_meta_learning(db: AsyncSession, instance_id: str) -> bool:
             Gene.slug == "meta-learning",
             InstanceGene.status == InstanceGeneStatus.installed,
             not_deleted(InstanceGene),
+            Gene.deleted_at.is_(None),
         )
     )
     return result.scalar_one_or_none() is not None
@@ -967,6 +1006,7 @@ async def has_gene_installed(db: AsyncSession, instance_id: str, gene_slug: str)
             Gene.slug == gene_slug,
             InstanceGene.status == InstanceGeneStatus.installed,
             not_deleted(InstanceGene),
+            Gene.deleted_at.is_(None),
         )
         .limit(1)
     )
@@ -1008,11 +1048,12 @@ async def install_gene(
     instance_id: str,
     gene_slug: str,
     genome_id: str | None = None,
+    org_id: str | None = None,
 ) -> dict:
     from app.api.workspaces import broadcast_event
     from app.services.instance_service import get_instance
 
-    instance = await get_instance(instance_id, db)
+    instance = await get_instance(instance_id, db, org_id)
 
     gene = await get_gene_by_slug(db, gene_slug)
 
@@ -1332,10 +1373,14 @@ async def _send_learning_task(
         skill = manifest.get("skill", {})
         learning = manifest.get("learning")
 
-        from app.core.config import settings
-
-        callback_base = getattr(settings, "NODESKCLAW_WEBHOOK_BASE_URL", "") or ""
-        callback_url = f"{callback_base}/api/v1/genes/learning-callback"
+        callback_base = get_nodeskclaw_webhook_base_url()
+        callback_url = build_gene_callback_url(
+            callback_base,
+            "/api/v1/genes/learning-callback",
+            ig.id,
+            instance.id,
+            "learn",
+        )
 
         gene_content = skill.get("content", "")
         force_deep = not _has_frontmatter(gene_content)
@@ -1387,14 +1432,17 @@ async def _apply_manifest_actions(
         await adapter.allow_tools(fs, tool_allow)
 
     scripts = manifest.get("scripts")
-    if scripts and isinstance(scripts, list):
+    if scripts and isinstance(scripts, (list, dict)):
         await _deploy_gene_scripts(fs, scripts, adapter)
 
 
 async def _deploy_gene_scripts(
-    fs: RemoteFS, script_names: list[str], adapter: GeneInstallAdapter,
+    fs: RemoteFS, scripts: list[str] | dict[str, str], adapter: GeneInstallAdapter,
 ) -> None:
-    """Load script files from gene_scripts directory and deploy them via adapter."""
+    """Deploy script files to the instance via adapter.
+
+    Supports old format (list of filenames to load locally) and new format (dict of filename to content).
+    """
     from pathlib import Path
 
     scripts_dir = Path(__file__).resolve().parent.parent / "data" / "gene_scripts"
@@ -1404,12 +1452,16 @@ async def _deploy_gene_scripts(
     if api_client_path.exists():
         scripts_to_deploy["_api_client.py"] = api_client_path.read_text()
 
-    for name in script_names:
-        script_path = scripts_dir / name
-        if script_path.exists():
-            scripts_to_deploy[name] = script_path.read_text()
-        else:
-            logger.warning("Gene script not found: %s", name)
+    if isinstance(scripts, dict):
+        for name, content in scripts.items():
+            scripts_to_deploy[name] = content
+    else:
+        for name in scripts:
+            script_path = scripts_dir / name
+            if script_path.exists():
+                scripts_to_deploy[name] = script_path.read_text()
+            else:
+                logger.warning("Gene script not found: %s", name)
 
     if scripts_to_deploy:
         await adapter.deploy_scripts(fs, scripts_to_deploy)
@@ -1433,9 +1485,13 @@ async def handle_learning_callback(
     ig_obj = ig.scalar_one_or_none()
     if not ig_obj:
         raise NotFoundError(f"学习任务 '{payload.task_id}' 不存在")
+    if ig_obj.instance_id != payload.instance_id:
+        raise BadRequestError("回调实例与学习任务不匹配")
 
     instance = await get_instance(ig_obj.instance_id, db)
-    gene = await db.execute(select(Gene).where(Gene.id == ig_obj.gene_id))
+    gene = await db.execute(
+        select(Gene).where(Gene.id == ig_obj.gene_id, Gene.deleted_at.is_(None))
+    )
     gene_obj = gene.scalar_one_or_none()
     if not gene_obj:
         raise NotFoundError("基因不存在")
@@ -1543,7 +1599,15 @@ async def handle_learning_callback(
 # ── Apply Genome ─────────────────────────────────
 
 
-async def apply_genome(db: AsyncSession, instance_id: str, genome_id: str) -> dict:
+async def apply_genome(
+    db: AsyncSession,
+    instance_id: str,
+    genome_id: str,
+    org_id: str | None = None,
+) -> dict:
+    from app.services.instance_service import get_instance
+
+    await get_instance(instance_id, db, org_id)
     genome_result = await db.execute(
         select(Genome).where(Genome.id == genome_id, not_deleted(Genome))
     )
@@ -1558,7 +1622,11 @@ async def apply_genome(db: AsyncSession, instance_id: str, genome_id: str) -> di
     installed_q = await db.execute(
         select(Gene.slug)
         .join(InstanceGene, InstanceGene.gene_id == Gene.id)
-        .where(InstanceGene.instance_id == instance_id, not_deleted(InstanceGene))
+        .where(
+            InstanceGene.instance_id == instance_id,
+            not_deleted(InstanceGene),
+            Gene.deleted_at.is_(None),
+        )
     )
     already_installed = {row[0] for row in installed_q}
 
@@ -1568,7 +1636,7 @@ async def apply_genome(db: AsyncSession, instance_id: str, genome_id: str) -> di
             results["skipped"].append(slug)
             continue
         try:
-            await install_gene(db, instance_id, slug, genome_id=genome.id)
+            await install_gene(db, instance_id, slug, genome_id=genome.id, org_id=org_id)
             results["installed"].append(slug)
         except AppException:
             results["skipped"].append(slug)
@@ -1637,7 +1705,9 @@ async def _recalc_gene_rating(db: AsyncSession, gene_id: str) -> None:
         )
     )
     avg = result.scalar() or 0.0
-    gene_result = await db.execute(select(Gene).where(Gene.id == gene_id))
+    gene_result = await db.execute(
+        select(Gene).where(Gene.id == gene_id, Gene.deleted_at.is_(None))
+    )
     gene = gene_result.scalar_one_or_none()
     if gene:
         gene.avg_rating = round(float(avg), 2)
@@ -1652,7 +1722,9 @@ async def _recalc_genome_rating(db: AsyncSession, genome_id: str) -> None:
         )
     )
     avg = result.scalar() or 0.0
-    genome_result = await db.execute(select(Genome).where(Genome.id == genome_id))
+    genome_result = await db.execute(
+        select(Genome).where(Genome.id == genome_id, Genome.deleted_at.is_(None))
+    )
     genome = genome_result.scalar_one_or_none()
     if genome:
         genome.avg_rating = round(float(avg), 2)
@@ -1692,10 +1764,14 @@ async def log_effectiveness(
     await db.commit()
     await _recalc_effectiveness_score(db, gene_id)
 
-    gene_result = await db.execute(select(Gene).where(Gene.id == gene_id))
+    gene_result = await db.execute(
+        select(Gene).where(Gene.id == gene_id, Gene.deleted_at.is_(None))
+    )
     gene = gene_result.scalar_one_or_none()
 
-    instance_result = await db.execute(select(Instance).where(Instance.id == instance_id))
+    instance_result = await db.execute(
+        select(Instance).where(Instance.id == instance_id, Instance.deleted_at.is_(None))
+    )
     instance = instance_result.scalar_one_or_none()
     if instance and gene:
         ws_ids = await _get_instance_workspace_ids(db, instance_id)
@@ -1708,6 +1784,42 @@ async def log_effectiveness(
         _fire_task(_report_effectiveness_to_registry(gene.slug, metric_type, value, getattr(gene, "source_registry", None)))
 
     return {"logged": True}
+
+
+async def log_task_outcome(
+    db: AsyncSession,
+    assignee_instance_id: str,
+    task_id: str,
+    task_title: str,
+    success: bool,
+    failure_reason: str | None = None,
+) -> int:
+    """Write task_success effect logs for all installed genes on the assignee instance."""
+    ig_result = await db.execute(
+        select(InstanceGene).where(
+            InstanceGene.instance_id == assignee_instance_id,
+            InstanceGene.status == InstanceGeneStatus.installed,
+            not_deleted(InstanceGene),
+        )
+    )
+    installed_genes = ig_result.scalars().all()
+
+    count = 0
+    ctx = {"task_id": task_id, "title": task_title}
+    if failure_reason:
+        ctx["failure_reason"] = failure_reason
+    context = json.dumps(ctx)
+    for ig in installed_genes:
+        await log_effectiveness(
+            db,
+            assignee_instance_id,
+            ig.gene_id,
+            metric_type=EffectMetricType.task_success,
+            value=1.0 if success else 0.0,
+            context=context,
+        )
+        count += 1
+    return count
 
 
 async def _report_install_to_registry(slug: str, source_registry: str | None = None) -> None:
@@ -1725,8 +1837,10 @@ async def _report_effectiveness_to_registry(
 
 
 async def _recalc_effectiveness_score(db: AsyncSession, gene_id: str) -> None:
-    """Recalculate effectiveness_score = user_rating 25% + agent_self_eval 25% + usage_effect 50%."""
-    gene_result = await db.execute(select(Gene).where(Gene.id == gene_id))
+    """Recalculate effectiveness_score = rating 20% + self_eval 15% + usage 30% + task_success 35%."""
+    gene_result = await db.execute(
+        select(Gene).where(Gene.id == gene_id, Gene.deleted_at.is_(None))
+    )
     gene = gene_result.scalar_one_or_none()
     if not gene:
         return
@@ -1761,7 +1875,33 @@ async def _recalc_effectiveness_score(db: AsyncSession, gene_id: str) -> None:
     total = pos_count + neg_count
     usage_effect = (pos_count / total) if total > 0 else 0.5
 
-    score = user_rating_norm * 0.25 + float(agent_eval) * 0.25 + usage_effect * 0.50
+    task_ok_result = await db.execute(
+        select(func.count()).where(
+            GeneEffectLog.gene_id == gene_id,
+            GeneEffectLog.metric_type == EffectMetricType.task_success,
+            GeneEffectLog.value >= 0.5,
+        )
+    )
+    task_ok = task_ok_result.scalar() or 0
+
+    task_fail_result = await db.execute(
+        select(func.count()).where(
+            GeneEffectLog.gene_id == gene_id,
+            GeneEffectLog.metric_type == EffectMetricType.task_success,
+            GeneEffectLog.value < 0.5,
+        )
+    )
+    task_fail = task_fail_result.scalar() or 0
+
+    task_total = task_ok + task_fail
+    task_success_rate = (task_ok / task_total) if task_total > 0 else 0.5
+
+    score = (
+        user_rating_norm * 0.20
+        + float(agent_eval) * 0.15
+        + usage_effect * 0.30
+        + task_success_rate * 0.35
+    )
     gene.effectiveness_score = round(score, 4)
     await db.commit()
 
@@ -1769,7 +1909,7 @@ async def _recalc_effectiveness_score(db: AsyncSession, gene_id: str) -> None:
 async def _get_effectiveness_breakdown(
     db: AsyncSession, gene_id: str, avg_rating: float
 ) -> dict:
-    """Return the three components that make up effectiveness_score."""
+    """Return the four components that make up effectiveness_score."""
     user_rating_norm = avg_rating / 5.0 if avg_rating else 0.0
 
     agent_eval_result = await db.execute(
@@ -1800,12 +1940,36 @@ async def _get_effectiveness_breakdown(
     total = pos_count + neg_count
     usage_effect = (pos_count / total) if total > 0 else 0.5
 
+    task_ok_result = await db.execute(
+        select(func.count()).where(
+            GeneEffectLog.gene_id == gene_id,
+            GeneEffectLog.metric_type == EffectMetricType.task_success,
+            GeneEffectLog.value >= 0.5,
+        )
+    )
+    task_success_count = task_ok_result.scalar() or 0
+
+    task_fail_result = await db.execute(
+        select(func.count()).where(
+            GeneEffectLog.gene_id == gene_id,
+            GeneEffectLog.metric_type == EffectMetricType.task_success,
+            GeneEffectLog.value < 0.5,
+        )
+    )
+    task_fail_count = task_fail_result.scalar() or 0
+
+    task_total = task_success_count + task_fail_count
+    task_success_rate = (task_success_count / task_total) if task_total > 0 else 0.5
+
     return {
         "user_rating": round(user_rating_norm, 4),
         "agent_eval": round(agent_eval, 4),
         "usage_effect": round(usage_effect, 4),
         "positive_count": pos_count,
         "negative_count": neg_count,
+        "task_success_rate": round(task_success_rate, 4),
+        "task_success_count": task_success_count,
+        "task_fail_count": task_fail_count,
     }
 
 
@@ -1838,12 +2002,16 @@ async def publish_variant(
     if ig.variant_published:
         raise ConflictError("该基因的变体已发布")
 
-    parent_gene = await db.execute(select(Gene).where(Gene.id == gene_id))
+    parent_gene = await db.execute(
+        select(Gene).where(Gene.id == gene_id, Gene.deleted_at.is_(None))
+    )
     parent = parent_gene.scalar_one_or_none()
     if not parent:
         raise NotFoundError("原始基因不存在")
 
-    instance_result = await db.execute(select(Instance).where(Instance.id == instance_id))
+    instance_result = await db.execute(
+        select(Instance).where(Instance.id == instance_id, Instance.deleted_at.is_(None))
+    )
     instance = instance_result.scalar_one_or_none()
     agent_display = instance.name if instance else instance_id[:8]
 
@@ -1900,19 +2068,23 @@ async def trigger_gene_creation(
     db: AsyncSession,
     instance_id: str,
     creation_prompt: str | None = None,
+    org_id: str | None = None,
 ) -> dict:
     from app.services.instance_service import get_instance
 
-    instance = await get_instance(instance_id, db)
-
-    from app.core.config import settings
-
-    callback_base = getattr(settings, "NODESKCLAW_WEBHOOK_BASE_URL", "") or ""
-    callback_url = f"{callback_base}/api/v1/genes/creation-callback"
-
+    instance = await get_instance(instance_id, db, org_id)
     import uuid
 
     task_id = str(uuid.uuid4())
+
+    callback_base = get_nodeskclaw_webhook_base_url()
+    callback_url = build_gene_callback_url(
+        callback_base,
+        "/api/v1/genes/creation-callback",
+        task_id,
+        instance.id,
+        "create",
+    )
 
     payload = {
         "mode": "create",
@@ -1945,9 +2117,14 @@ async def handle_creation_callback(
     meta = payload.meta or {}
 
     instance_result = await db.execute(
-        select(Instance).where(Instance.id == payload.instance_id)
+        select(Instance).where(
+            Instance.id == payload.instance_id,
+            Instance.deleted_at.is_(None),
+        )
     )
     instance = instance_result.scalar_one_or_none()
+    if instance is None:
+        raise NotFoundError("实例不存在")
 
     gene_desc = meta.get("gene_description", "")
     gene_short_desc = gene_desc[:256] if gene_desc else None
@@ -1984,13 +2161,27 @@ async def handle_creation_callback(
             "gene_name": gene.name,
         })
 
-    _fire_task(_push_created_gene_to_registry(gene_manifest, gene.slug, gene.name, gene_desc, meta))
+    _fire_task(
+        _push_created_gene_to_registry(
+            gene_manifest,
+            gene.slug,
+            gene.name,
+            gene_desc,
+            meta,
+            instance.runtime,
+        )
+    )
 
     return {"status": "created", "gene_id": gene.id, "slug": gene.slug}
 
 
 async def _push_created_gene_to_registry(
-    manifest: dict, slug: str, name: str, description: str, meta: dict,
+    manifest: dict,
+    slug: str,
+    name: str,
+    description: str,
+    meta: dict,
+    runtime: str,
 ) -> None:
     """Best-effort push of an Agent-created gene to default registry."""
     full_manifest = {
@@ -2003,7 +2194,7 @@ async def _push_created_gene_to_registry(
         "tags": meta.get("suggested_tags", []),
         "icon": meta.get("icon"),
         "author": {"type": "agent", "name": "nodeskclaw"},
-        "compatibility": [{"product": instance.runtime if instance else "openclaw", "min_version": "1.0.0"}],
+        "compatibility": [{"product": runtime or "openclaw", "min_version": "1.0.0"}],
         **manifest,
     }
     aggregator = get_aggregator()
@@ -2086,6 +2277,7 @@ async def refresh_gene_skills(db: AsyncSession, gene_slugs: list[str]) -> dict:
             InstanceGene.status == InstanceGeneStatus.installed,
             not_deleted(InstanceGene),
             not_deleted(Instance),
+            Gene.deleted_at.is_(None),
         )
     )
     rows = result.all()
@@ -2135,10 +2327,15 @@ async def refresh_gene_skills(db: AsyncSession, gene_slugs: list[str]) -> dict:
     return {"refreshed": refreshed, "failed": failed}
 
 
-async def uninstall_gene(db: AsyncSession, instance_id: str, gene_id: str) -> dict:
+async def uninstall_gene(
+    db: AsyncSession,
+    instance_id: str,
+    gene_id: str,
+    org_id: str | None = None,
+) -> dict:
     from app.services.instance_service import get_instance
 
-    instance = await get_instance(instance_id, db)
+    await get_instance(instance_id, db, org_id)
 
     ig_result = await db.execute(
         select(InstanceGene).where(
@@ -2231,10 +2428,14 @@ async def _send_forgetting_task(
         manifest = _json_loads(gene.manifest) or {}
         skill_content = manifest.get("skill", {}).get("content", "")
 
-        from app.core.config import settings
-
-        callback_base = getattr(settings, "NODESKCLAW_WEBHOOK_BASE_URL", "") or ""
-        callback_url = f"{callback_base}/api/v1/genes/forgetting-callback"
+        callback_base = get_nodeskclaw_webhook_base_url()
+        callback_url = build_gene_callback_url(
+            callback_base,
+            "/api/v1/genes/forgetting-callback",
+            ig.id,
+            instance.id,
+            "forget",
+        )
 
         payload = {
             "mode": "forget",
@@ -2273,9 +2474,13 @@ async def handle_forgetting_callback(
     ig = await db.get(InstanceGene, payload.task_id)
     if not ig:
         raise NotFoundError(f"InstanceGene not found: {payload.task_id}")
+    if ig.instance_id != payload.instance_id:
+        raise BadRequestError("回调实例与遗忘任务不匹配")
 
     instance = await get_instance(ig.instance_id, db)
-    gene_result = await db.execute(select(Gene).where(Gene.id == ig.gene_id))
+    gene_result = await db.execute(
+        select(Gene).where(Gene.id == ig.gene_id, Gene.deleted_at.is_(None))
+    )
     gene = gene_result.scalar_one_or_none()
 
     ws_ids = await _get_instance_workspace_ids(db, instance.id)
@@ -2382,7 +2587,11 @@ async def get_evolution_log(
     instance_id: str,
     page: int = 1,
     page_size: int = 20,
+    org_id: str | None = None,
 ) -> list[dict]:
+    from app.services.instance_service import get_instance
+
+    await get_instance(instance_id, db, org_id)
     offset = (page - 1) * page_size
     result = await db.execute(
         select(EvolutionEvent)
@@ -2588,6 +2797,7 @@ async def get_gene_activity(db: AsyncSession, limit: int = 50) -> list[dict]:
     result = await db.execute(
         select(GeneEffectLog, Gene.slug, Gene.name)
         .join(Gene, GeneEffectLog.gene_id == Gene.id)
+        .where(Gene.deleted_at.is_(None))
         .order_by(GeneEffectLog.created_at.desc())
         .limit(limit)
     )
@@ -2614,7 +2824,7 @@ async def get_gene_matrix(db: AsyncSession) -> list[dict]:
             InstanceGene.status,
         )
         .join(Gene, InstanceGene.gene_id == Gene.id)
-        .where(not_deleted(InstanceGene))
+        .where(not_deleted(InstanceGene), Gene.deleted_at.is_(None))
         .order_by(InstanceGene.instance_id, Gene.slug)
     )
     return [
@@ -2639,7 +2849,12 @@ async def get_co_install_analysis(db: AsyncSession, min_count: int = 2) -> list[
         .join(ig2, (ig1.c.instance_id == ig2.c.instance_id) & (ig1.c.gene_id < ig2.c.gene_id))
         .join(g1, ig1.c.gene_id == g1.c.id)
         .join(g2, ig2.c.gene_id == g2.c.id)
-        .where(ig1.c.deleted_at.is_(None), ig2.c.deleted_at.is_(None))
+        .where(
+            ig1.c.deleted_at.is_(None),
+            ig2.c.deleted_at.is_(None),
+            g1.c.deleted_at.is_(None),
+            g2.c.deleted_at.is_(None),
+        )
         .group_by(g1.c.slug, g2.c.slug)
         .having(func.count() >= min_count)
         .order_by(func.count().desc())

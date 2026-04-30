@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.workspaces import broadcast_event
 from app.core import hooks
 from app.core.deps import get_current_org, get_current_org_or_agent, get_db
+from app.core.exceptions import NotFoundError
 from app.models.base import not_deleted
 from app.models.corridor import CorridorHex, HexConnection, HumanHex, is_adjacent, ordered_pair
 from app.models.instance import Instance
@@ -41,6 +42,17 @@ def _ok(data=None, message: str = "success"):
     return {"code": 0, "message": message, "data": data}
 
 
+def _corridor_http_error(status_code: int, error_code: int, message_key: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error_code": error_code,
+            "message_key": message_key,
+            "message": message,
+        },
+    )
+
+
 def _org_id(org) -> str:
     return org.id if hasattr(org, "id") else org.get("org_id", "")
 
@@ -67,7 +79,7 @@ async def _check_workspace(workspace_id: str, org, db: AsyncSession) -> Workspac
     )
     ws = result.scalar_one_or_none()
     if not ws:
-        raise HTTPException(status_code=404, detail="cyber office not found")
+        raise NotFoundError("办公室不存在", "errors.workspace.not_found")
     return ws
 
 
@@ -118,7 +130,7 @@ async def create_corridor_hex(
     await _check_workspace(workspace_id, org, db)
     await wm_service.check_workspace_access(workspace_id, user, "edit_topology", db)
     if await _is_hex_occupied(workspace_id, body.hex_q, body.hex_r, db):
-        raise HTTPException(400, "hex position already occupied")
+        raise _corridor_http_error(400, 40070, "errors.corridor.hex_position_occupied", "当前位置已被占用")
 
     ch = CorridorHex(
         id=str(uuid.uuid4()),
@@ -141,6 +153,9 @@ async def create_corridor_hex(
     )
 
     await corridor_router.auto_connect_hex(workspace_id, body.hex_q, body.hex_r, user.id if user else None, db)
+
+    from app.services import conversation_service
+    await conversation_service.sync_conversations_from_topology(workspace_id, db)
 
     await db.commit()
     await db.refresh(ch)
@@ -209,7 +224,7 @@ async def update_corridor_hex(
     )
     ch = result.scalar_one_or_none()
     if not ch:
-        raise HTTPException(404, "corridor hex not found")
+        raise _corridor_http_error(404, 40480, "errors.corridor.hex_not_found", "走廊格子不存在")
 
     if body.display_name is not None:
         ch.display_name = body.display_name
@@ -220,7 +235,7 @@ async def update_corridor_hex(
         new_q, new_r = body.hex_q, body.hex_r
         if (new_q, new_r) != (old_q, old_r):
             if await _is_hex_occupied(workspace_id, new_q, new_r, db):
-                raise HTTPException(400, "hex position already occupied")
+                raise _corridor_http_error(400, 40070, "errors.corridor.hex_position_occupied", "当前位置已被占用")
             ch.hex_q = new_q
             ch.hex_r = new_r
             position_changed = True
@@ -270,6 +285,7 @@ async def delete_corridor_hex(
     user, org = org_ctx
     await _check_workspace(workspace_id, org, db)
     await wm_service.check_workspace_access(workspace_id, user, "edit_topology", db)
+
     result = await db.execute(
         select(CorridorHex).where(
             CorridorHex.id == hex_id,
@@ -278,8 +294,15 @@ async def delete_corridor_hex(
         )
     )
     ch = result.scalar_one_or_none()
-    if not ch:
-        raise HTTPException(404, "corridor hex not found")
+
+    card = await node_card_service.get_node_card(db, node_id=hex_id, workspace_id=workspace_id)
+
+    if not ch and not card:
+        raise _corridor_http_error(404, 40480, "errors.corridor.hex_not_found", "走廊格子不存在")
+
+    hex_q = card.hex_q if card else ch.hex_q
+    hex_r = card.hex_r if card else ch.hex_r
+    deleted_id = hex_id
 
     conns = await db.execute(
         select(HexConnection).where(
@@ -287,22 +310,28 @@ async def delete_corridor_hex(
             HexConnection.auto_created.is_(True),
             not_deleted(HexConnection),
             (
-                ((HexConnection.hex_a_q == ch.hex_q) & (HexConnection.hex_a_r == ch.hex_r))
-                | ((HexConnection.hex_b_q == ch.hex_q) & (HexConnection.hex_b_r == ch.hex_r))
+                ((HexConnection.hex_a_q == hex_q) & (HexConnection.hex_a_r == hex_r))
+                | ((HexConnection.hex_b_q == hex_q) & (HexConnection.hex_b_r == hex_r))
             ),
         )
     )
     for conn in conns.scalars().all():
         conn.soft_delete()
 
-    ch.soft_delete()
-    await node_card_service.soft_delete_node_card(db, node_id=ch.id, workspace_id=workspace_id)
+    if ch:
+        ch.soft_delete()
+    if card:
+        card.soft_delete()
+
+    from app.services import conversation_service
+    await conversation_service.sync_conversations_from_topology(workspace_id, db)
+
     await db.commit()
     actor_type, actor_id = _actor(org_ctx)
-    broadcast_event(workspace_id, "corridor:hex_removed", {"hex_id": ch.id})
+    broadcast_event(workspace_id, "corridor:hex_removed", {"hex_id": deleted_id})
     await hooks.emit(
         "topology_change", db=db, workspace_id=workspace_id,
-        action="corridor_hex_deleted", target_type="corridor_hex", target_id=ch.id,
+        action="corridor_hex_deleted", target_type="corridor_hex", target_id=deleted_id,
         actor_type=actor_type, actor_id=actor_id,
     )
     return _ok(message="deleted")
@@ -319,11 +348,11 @@ async def create_connection(
     await _check_workspace(workspace_id, org, db)
     await wm_service.check_workspace_access(workspace_id, user, "edit_topology", db)
     if not is_adjacent(body.hex_a_q, body.hex_a_r, body.hex_b_q, body.hex_b_r):
-        raise HTTPException(400, "hexes must be adjacent")
+        raise _corridor_http_error(400, 40071, "errors.corridor.hexes_not_adjacent", "两个格子必须相邻")
     if not await _is_hex_occupied(workspace_id, body.hex_a_q, body.hex_a_r, db):
-        raise HTTPException(400, "hex A is not occupied")
+        raise _corridor_http_error(400, 40072, "errors.corridor.hex_a_not_occupied", "格子 A 尚未被占用")
     if not await _is_hex_occupied(workspace_id, body.hex_b_q, body.hex_b_r, db):
-        raise HTTPException(400, "hex B is not occupied")
+        raise _corridor_http_error(400, 40073, "errors.corridor.hex_b_not_occupied", "格子 B 尚未被占用")
 
     aq, ar, bq, br = ordered_pair(body.hex_a_q, body.hex_a_r, body.hex_b_q, body.hex_b_r)
     existing = await db.execute(
@@ -335,7 +364,7 @@ async def create_connection(
         ).limit(1)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(400, "connection already exists")
+        raise _corridor_http_error(400, 40074, "errors.corridor.connection_exists", "连接已存在")
 
     conn = HexConnection(
         id=str(uuid.uuid4()),
@@ -345,6 +374,10 @@ async def create_connection(
         created_by=user.id if user else None,
     )
     db.add(conn)
+
+    from app.services import conversation_service
+    await conversation_service.sync_conversations_from_topology(workspace_id, db)
+
     await db.commit()
     await db.refresh(conn)
     actor_type, actor_id = _actor(org_ctx)
@@ -409,8 +442,12 @@ async def delete_connection(
     )
     conn = result.scalar_one_or_none()
     if not conn:
-        raise HTTPException(404, "connection not found")
+        raise _corridor_http_error(404, 40481, "errors.corridor.connection_not_found", "连接不存在")
     conn.soft_delete()
+
+    from app.services import conversation_service
+    await conversation_service.sync_conversations_from_topology(workspace_id, db)
+
     await db.commit()
     actor_type, actor_id = _actor(org_ctx)
     broadcast_event(workspace_id, "connection:removed", {"conn_id": conn.id})
@@ -440,9 +477,9 @@ async def create_human_hex(
         ).limit(1)
     )
     if not member_q.scalar_one_or_none():
-        raise HTTPException(404, "member not found in this workspace")
+        raise _corridor_http_error(404, 40482, "errors.corridor.member_not_found", "成员不在当前办公室中")
     if await _is_hex_occupied(workspace_id, body.hex_q, body.hex_r, db):
-        raise HTTPException(400, "hex position already occupied")
+        raise _corridor_http_error(400, 40070, "errors.corridor.hex_position_occupied", "当前位置已被占用")
     actor_type, actor_id = _actor(org_ctx)
     hh = HumanHex(
         id=str(uuid.uuid4()),
@@ -508,14 +545,14 @@ async def update_human_hex(
     )
     hh = result.scalar_one_or_none()
     if not hh:
-        raise HTTPException(404, "human hex not found")
+        raise _corridor_http_error(404, 40483, "errors.corridor.human_hex_not_found", "人工节点不存在")
     new_q = body.hex_q if body.hex_q is not None else hh.hex_q
     new_r = body.hex_r if body.hex_r is not None else hh.hex_r
     position_changed = False
     old_q, old_r = hh.hex_q, hh.hex_r
     if (new_q, new_r) != (old_q, old_r):
         if await _is_hex_occupied(workspace_id, new_q, new_r, db):
-            raise HTTPException(400, "hex position already occupied")
+            raise _corridor_http_error(400, 40070, "errors.corridor.hex_position_occupied", "当前位置已被占用")
         hh.hex_q = new_q
         hh.hex_r = new_r
         position_changed = True
@@ -593,10 +630,17 @@ async def delete_human_hex(
         )
     )
     hh = result.scalar_one_or_none()
-    if not hh:
-        raise HTTPException(404, "human hex not found")
-    hh.soft_delete()
-    await node_card_service.soft_delete_node_card(db, node_id=hh.id, workspace_id=workspace_id)
+
+    card = await node_card_service.get_node_card(db, node_id=hex_id, workspace_id=workspace_id)
+
+    if not hh and not card:
+        raise _corridor_http_error(404, 40483, "errors.corridor.human_hex_not_found", "人工节点不存在")
+
+    if hh:
+        hh.soft_delete()
+    if card:
+        card.soft_delete()
+
     await db.commit()
     actor_type, actor_id = _actor(org_ctx)
     broadcast_event(workspace_id, "human:hex_removed", {"hex_id": hex_id})

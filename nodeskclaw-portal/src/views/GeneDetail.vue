@@ -30,6 +30,7 @@ import {
   HardDrive,
 } from 'lucide-vue-next'
 import { renderMarkdown } from '@/utils/markdown'
+import { copyToClipboard } from '@/utils/clipboard'
 import { useGeneStore } from '@/stores/gene'
 import type { GeneItem, GenomeItem } from '@/stores/gene'
 import api from '@/services/api'
@@ -39,7 +40,7 @@ const router = useRouter()
 const store = useGeneStore()
 const { t } = useI18n()
 
-const geneId = computed(() => route.params.id as string)
+const geneSlug = computed(() => route.params.slug as string)
 const gene = computed(() => store.currentGene)
 const synergies = ref<GeneItem[]>([])
 const variants = ref<GeneItem[]>([])
@@ -162,11 +163,11 @@ const hasFrontmatter = computed(() => {
 })
 
 async function onMount() {
-  await store.fetchGene(geneId.value)
+  await store.fetchGene(geneSlug.value)
   const [s, v, pg] = await Promise.all([
-    store.fetchGeneSynergies(geneId.value),
-    store.fetchGeneVariants(geneId.value),
-    store.fetchGeneGenomes(geneId.value),
+    store.fetchGeneSynergies(geneSlug.value),
+    store.fetchGeneVariants(geneSlug.value),
+    store.fetchGeneGenomes(geneSlug.value),
   ])
   synergies.value = s
   variants.value = v
@@ -179,8 +180,8 @@ function goBack() {
   router.push('/gene-market')
 }
 
-function goToGene(id: string) {
-  router.push(`/gene-market/gene/${id}`)
+function goToGene(slug: string) {
+  router.push(`/gene-market/gene/${slug}`)
 }
 
 function openInstallDialog() {
@@ -199,7 +200,7 @@ function openInstallDialog() {
     instances.value = []
   })
 
-  const fetchInstalled = api.get(`/genes/${geneId.value}/installed-instances`).then((res) => {
+  const fetchInstalled = api.get(`/genes/${geneSlug.value}/installed-instances`).then((res) => {
     installedInstanceIds.value = new Set(res.data.data || [])
   }).catch(() => {
     installedInstanceIds.value = new Set()
@@ -217,17 +218,17 @@ function closeInstallDialog() {
 function goToInstanceGenes(instanceId: string) {
   router.push({
     path: `/instances/${instanceId}/genes`,
-    query: { focus_gene_id: geneId.value },
+    query: { focus_gene_id: geneSlug.value },
   })
 }
 
 const copiedSlug = ref<string | null>(null)
 async function copySlug(slug: string) {
-  try {
-    await navigator.clipboard.writeText(slug)
+  const ok = await copyToClipboard(slug)
+  if (ok) {
     copiedSlug.value = slug
     setTimeout(() => { copiedSlug.value = null }, 1500)
-  } catch { /* ignore */ }
+  }
 }
 
 function selectInstance(instanceId: string) {
@@ -410,7 +411,7 @@ function selectInstance(instanceId: string) {
                 v-for="s in synergies"
                 :key="s.id"
                 class="shrink-0 w-48 p-4 rounded-xl border border-border bg-card hover:border-primary/30 transition cursor-pointer"
-                @click="goToGene(s.id)"
+                @click="goToGene(s.slug)"
               >
                 <div class="flex items-center gap-2 mb-1">
                   <div class="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
@@ -432,7 +433,7 @@ function selectInstance(instanceId: string) {
                 v-for="v in variants"
                 :key="v.id"
                 class="p-4 rounded-xl border border-border bg-card hover:border-primary/30 transition cursor-pointer"
-                @click="goToGene(v.id)"
+                @click="goToGene(v.slug)"
               >
                 <div class="flex items-center justify-between gap-4">
                   <div class="flex items-center gap-3 min-w-0">
@@ -494,7 +495,7 @@ function selectInstance(instanceId: string) {
                     <span class="text-xs text-foreground">{{ t('gene.userRatingComponent') }}</span>
                     <span class="text-xs text-muted-foreground">
                       {{ Math.round(gene.effectiveness_breakdown.user_rating * 100) }}%
-                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '25%' }) }}</span>
+                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '20%' }) }}</span>
                     </span>
                   </div>
                   <div class="h-1.5 rounded-full bg-muted overflow-hidden">
@@ -509,7 +510,7 @@ function selectInstance(instanceId: string) {
                     <span class="text-xs text-foreground">{{ t('gene.agentEvalComponent') }}</span>
                     <span class="text-xs text-muted-foreground">
                       {{ Math.round(gene.effectiveness_breakdown.agent_eval * 100) }}%
-                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '25%' }) }}</span>
+                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '15%' }) }}</span>
                     </span>
                   </div>
                   <div class="h-1.5 rounded-full bg-muted overflow-hidden">
@@ -524,7 +525,7 @@ function selectInstance(instanceId: string) {
                     <span class="text-xs text-foreground">{{ t('gene.usageEffectComponent') }}</span>
                     <span class="text-xs text-muted-foreground">
                       {{ Math.round(gene.effectiveness_breakdown.usage_effect * 100) }}%
-                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '50%' }) }}</span>
+                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '30%' }) }}</span>
                       <span
                         v-if="gene.effectiveness_breakdown.positive_count + gene.effectiveness_breakdown.negative_count > 0"
                         class="text-muted-foreground/60 ml-1"
@@ -537,6 +538,27 @@ function selectInstance(instanceId: string) {
                     <div
                       class="h-full rounded-full bg-emerald-400 transition-all"
                       :style="{ width: `${Math.min(100, gene.effectiveness_breakdown.usage_effect * 100)}%` }"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-foreground">{{ t('gene.taskSuccessComponent') }}</span>
+                    <span class="text-xs text-muted-foreground">
+                      {{ Math.round((gene.effectiveness_breakdown.task_success_rate ?? 0.5) * 100) }}%
+                      <span class="text-muted-foreground/60 ml-1">{{ t('gene.weightLabel', { weight: '35%' }) }}</span>
+                      <span
+                        v-if="(gene.effectiveness_breakdown.task_success_count ?? 0) + (gene.effectiveness_breakdown.task_fail_count ?? 0) > 0"
+                        class="text-muted-foreground/60 ml-1"
+                      >
+                        ({{ t('gene.taskSuccessCount', { success: gene.effectiveness_breakdown.task_success_count ?? 0, fail: gene.effectiveness_breakdown.task_fail_count ?? 0 }) }})
+                      </span>
+                    </span>
+                  </div>
+                  <div class="h-1.5 rounded-full bg-muted overflow-hidden">
+                    <div
+                      class="h-full rounded-full bg-violet-400 transition-all"
+                      :style="{ width: `${Math.min(100, (gene.effectiveness_breakdown.task_success_rate ?? 0.5) * 100)}%` }"
                     />
                   </div>
                 </div>

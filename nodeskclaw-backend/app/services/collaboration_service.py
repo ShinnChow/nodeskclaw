@@ -1,7 +1,6 @@
 """Collaboration message handling — shared by tunnel and (legacy) webhook."""
 
 import asyncio
-import json
 import logging
 from typing import Coroutine
 
@@ -37,6 +36,7 @@ async def handle_collaboration_event(instance_id: str, payload: dict) -> None:
         target=payload.get("target", ""),
         text=payload.get("text", ""),
         depth=payload.get("depth", 0),
+        conversation_id=payload.get("conversation_id"),
     )
 
 
@@ -47,6 +47,7 @@ async def handle_collaboration_message(
     target: str,
     text: str,
     depth: int = 0,
+    conversation_id: str | None = None,
 ) -> None:
     """Process an inbound collaboration message from a channel plugin.
 
@@ -54,32 +55,29 @@ async def handle_collaboration_message(
     Channel plugins cannot track session depth, so when depth=0 (the default
     from plugins), we derive the actual chain depth from recent DB messages.
     """
-    # Fast-path guard: if the caller already supplied an excessive depth,
-    # avoid opening a DB session at all.
-    if depth > msg_service.MAX_COLLABORATION_DEPTH:
+    if depth > msg_service.ABSOLUTE_MAX_COLLABORATION_DEPTH:
         logger.warning(
-            "Collaboration depth exceeded (%d > %d) from instance %s",
+            "Collaboration depth exceeded absolute max (%d > %d) from instance %s",
             depth,
-            msg_service.MAX_COLLABORATION_DEPTH,
+            msg_service.ABSOLUTE_MAX_COLLABORATION_DEPTH,
             source_instance_id,
         )
         return
 
     async with async_session_factory() as db:
+        limit = await msg_service.get_collaboration_depth_limit(db, workspace_id)
+
         if depth == 0:
             inferred = await _infer_chain_depth(db, workspace_id, source_instance_id)
             if inferred is not None:
                 depth = inferred
 
-            # Re-check after inference in case the derived depth exceeds the limit.
-            if depth > msg_service.MAX_COLLABORATION_DEPTH:
-                logger.warning(
-                    "Collaboration depth exceeded (%d > %d) from instance %s",
-                    depth,
-                    msg_service.MAX_COLLABORATION_DEPTH,
-                    source_instance_id,
-                )
-                return
+        if depth > limit:
+            logger.warning(
+                "Collaboration depth exceeded (%d > %d) from instance %s",
+                depth, limit, source_instance_id,
+            )
+            return
 
         source_inst = await _get_instance(db, source_instance_id)
         if source_inst is None:
@@ -88,15 +86,39 @@ async def handle_collaboration_message(
 
         source_name = source_inst.agent_display_name or source_inst.name
 
+        from app.services import conversation_service
+
         resolved_target_id: str | None = None
         if target.startswith("agent:"):
             target_inst = await _find_agent_by_name_or_id(db, workspace_id, target[6:])
             if target_inst:
                 resolved_target_id = target_inst.id
+                from app.services import corridor_router
+                target_hex = await corridor_router.get_agent_hex_in_workspace(
+                    target_inst.id, workspace_id, db,
+                )
+                if target_hex is not None:
+                    allowed, reason = await corridor_router.check_topology_access(
+                        workspace_id, source_instance_id,
+                        target_hex[0], target_hex[1], db,
+                    )
+                    if not allowed:
+                        from app.api.workspaces import broadcast_event
+                        broadcast_event(workspace_id, "agent:topology_blocked", {
+                            "source_instance_id": source_instance_id,
+                            "source_name": source_name,
+                            "target": target,
+                            "reason": reason,
+                        })
+                        return
         elif target.startswith("human:"):
             human_name = target[6:]
             hh = await _find_human_by_display_name(db, workspace_id, human_name)
             if hh:
+                resolved_conv_id = await conversation_service.resolve_conversation_for_message(
+                    workspace_id, source_instance_id, "",
+                    db, inherited_conversation_id=conversation_id,
+                )
                 await msg_service.record_message(
                     db,
                     workspace_id=workspace_id,
@@ -106,6 +128,7 @@ async def handle_collaboration_message(
                     content=text,
                     message_type="collaboration",
                     depth=depth,
+                    conversation_id=resolved_conv_id,
                 )
                 from app.api.workspaces import broadcast_event
                 broadcast_event(workspace_id, "agent:collaboration", {
@@ -113,6 +136,7 @@ async def handle_collaboration_message(
                     "agent_name": source_name,
                     "target": target,
                     "content": text,
+                    "conversation_id": resolved_conv_id,
                 })
                 await _route_to_human(
                     db, workspace_id, source_instance_id, source_name, hh, text,
@@ -121,6 +145,15 @@ async def handle_collaboration_message(
                 return
             else:
                 logger.warning("Human target not found: %s in workspace %s", human_name, workspace_id)
+
+        resolved_conv_id = await conversation_service.resolve_conversation_for_message(
+            workspace_id, source_instance_id, resolved_target_id or "",
+            db, inherited_conversation_id=conversation_id,
+        )
+
+        group_member_ids = await conversation_service.get_conversation_members(
+            resolved_conv_id, db,
+        ) if resolved_conv_id else []
 
         await msg_service.record_message(
             db,
@@ -132,6 +165,7 @@ async def handle_collaboration_message(
             message_type="collaboration",
             target_instance_id=resolved_target_id,
             depth=depth,
+            conversation_id=resolved_conv_id,
         )
 
         from app.api.workspaces import broadcast_event
@@ -140,6 +174,7 @@ async def handle_collaboration_message(
             "agent_name": source_name,
             "target": target,
             "content": text,
+            "conversation_id": resolved_conv_id,
         })
 
         from app.services.runtime.messaging.bus import message_bus
@@ -152,6 +187,8 @@ async def handle_collaboration_message(
             target=target,
             content=text,
             depth=depth,
+            conversation_id=resolved_conv_id,
+            group_member_ids=group_member_ids,
         )
 
         result = await message_bus.publish(envelope, db=db)
@@ -338,8 +375,11 @@ async def _find_human_by_display_name(
     return None
 
 
-def _looks_like_uuid(s: str) -> bool:
+def looks_like_uuid(s: str) -> bool:
     return len(s) == 36 and s.count("-") == 4
+
+
+_looks_like_uuid = looks_like_uuid
 
 
 async def _get_instance(db: AsyncSession, instance_id: str) -> Instance | None:
@@ -352,7 +392,7 @@ async def _get_instance(db: AsyncSession, instance_id: str) -> Instance | None:
     return result.scalar_one_or_none()
 
 
-async def _find_agent_by_name_or_id(
+async def find_agent_by_name_or_id(
     db: AsyncSession, workspace_id: str, identifier: str,
 ) -> Instance | None:
     result = await db.execute(
@@ -376,6 +416,9 @@ async def _find_agent_by_name_or_id(
         if display.lower() == id_lower or inst.name.lower() == id_lower:
             return inst
     return None
+
+
+_find_agent_by_name_or_id = find_agent_by_name_or_id
 
 
 async def _get_workspace_agents(db: AsyncSession, workspace_id: str) -> list[Instance]:
@@ -416,6 +459,8 @@ async def _invoke_target_agent(
     async with async_session_factory() as db:
         ws_info = await workspace_service.get_workspace(db, workspace_id)
         recent_messages = await msg_service.get_recent_messages(db, workspace_id)
+        from app.services.corridor_router import get_reachable_names
+        reachable = await get_reachable_names(workspace_id, instance_id, db)
 
     members: list[dict] = []
     if ws_info and ws_info.agents:
@@ -433,6 +478,7 @@ async def _invoke_target_agent(
         members=members,
         recent_messages=recent_messages,
         workspace_id=workspace_id,
+        reachable_names=reachable,
     )
 
     messages_payload = [
@@ -457,12 +503,20 @@ async def _invoke_target_agent(
         )
         async for chunk_msg in chat_stream:
             if chunk_msg.type == TunnelMessageType.CHAT_RESPONSE_ERROR:
-                logger.error("Target agent %s returned error: %s", agent_name, chunk_msg.payload.get("error"))
-                broadcast_event(workspace_id, "agent:error", {
+                raw_error = chunk_msg.payload.get("error", "unknown")
+                err_type = chunk_msg.payload.get("error_type")
+                logger.error("Target agent %s returned error: %s", agent_name, raw_error)
+                error_code = "llm_error" if err_type == "llm" else "stream_error"
+                evt: dict = {
                     "instance_id": instance_id,
                     "agent_name": agent_name,
-                    "error": chunk_msg.payload.get("error", "unknown"),
-                })
+                    "error": error_code,
+                    "error_detail": str(raw_error)[:256],
+                }
+                raw_body = chunk_msg.payload.get("error_raw")
+                if raw_body:
+                    evt["error_raw"] = str(raw_body)[:2048]
+                broadcast_event(workspace_id, "agent:error", evt)
                 return False
             if chunk_msg.type == TunnelMessageType.CHAT_RESPONSE_DONE:
                 break
@@ -498,7 +552,8 @@ async def _invoke_target_agent(
         broadcast_event(workspace_id, "agent:error", {
             "instance_id": instance_id,
             "agent_name": agent_name,
-            "error": str(e),
+            "error": "stream_error",
+            "error_detail": str(e)[:256],
         })
         return False
 
@@ -534,6 +589,12 @@ async def _invoke_target_agent(
                 target_instance_id=source_instance_id,
                 depth=depth,
             )
+    elif not full_response:
+        broadcast_event(workspace_id, "agent:error", {
+            "instance_id": instance_id,
+            "agent_name": agent_name,
+            "error": "empty_response",
+        })
     else:
         broadcast_event(workspace_id, "agent:done", {
             "instance_id": instance_id,
@@ -548,6 +609,7 @@ async def send_system_message_to_agents(
     agent_ids: list[str],
     message: str,
     db: AsyncSession,
+    mention_targets: list[str] | None = None,
 ) -> None:
     """Send a system-generated message to specific agents via the MessageBus."""
     from app.services.runtime.messaging.bus import message_bus
@@ -558,6 +620,7 @@ async def send_system_message_to_agents(
         content=message,
         source_label="system_notify",
         targets=agent_ids,
+        mention_targets=mention_targets,
     )
 
     result = await message_bus.publish(envelope, db=db)

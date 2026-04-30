@@ -22,6 +22,7 @@ export interface WorkspaceListItem {
   description: string
   color: string
   icon: string
+  cluster_id?: string
   agent_count: number
   agents: AgentBrief[]
   created_at: string
@@ -35,6 +36,8 @@ export interface WorkspaceInfo {
   color: string
   icon: string
   created_by: string
+  cluster_id?: string
+  source_template_id?: string | null
   agent_count: number
   agents: AgentBrief[]
   created_at: string
@@ -50,6 +53,44 @@ export interface WorkspaceTemplateItem {
   visibility: string
   created_by: string | null
   created_at: string | null
+  agent_count?: number
+  human_count?: number
+  agent_names?: string[]
+  can_deploy_from_template?: boolean
+  source_workspace_id?: string | null
+}
+
+export interface WorkspaceTemplateDetail extends WorkspaceTemplateItem {
+  topology_snapshot?: Record<string, unknown>
+  blackboard_snapshot?: Record<string, unknown>
+  gene_assignments?: unknown[]
+  agent_specs?: Array<Record<string, unknown>>
+  human_specs?: Array<Record<string, unknown>>
+  source_workspace_id?: string | null
+  can_deploy_from_template?: boolean
+}
+
+export interface ActiveWorkspaceDeployItem {
+  id: string
+  workspace_id: string | null
+  workspace_name: string
+  template_id: string
+  status: string
+  total_agents: number
+  completed_agents: number
+  failed_agents: number
+}
+
+export interface TemplateCollectPreview {
+  agent_specs: Array<Record<string, unknown>>
+  human_specs: Array<Record<string, unknown>>
+  collect_warnings: string[]
+  agent_count: number
+  human_count: number
+  topology_snapshot?: {
+    nodes: Array<{ hex_q: number; hex_r: number; node_type: string; display_name: string; entity_id: string | null }>
+    edges: Array<{ a_q: number; a_r: number; b_q: number; b_r: number; direction: string; auto_created: boolean }>
+  }
 }
 
 export interface TaskInfo {
@@ -65,11 +106,27 @@ export interface TaskInfo {
   estimated_value: number | null
   actual_value: number | null
   token_cost: number | null
+  prompt_token_cost: number | null
+  completion_token_cost: number | null
   blocker_reason: string | null
   completed_at: string | null
   archived_at: string | null
+  schedule_id: string | null
+  deadline: string | null
+  failure_reason: string | null
   created_at: string
   updated_at: string
+}
+
+export interface PaginationInfo {
+  page: number
+  page_size: number
+  total: number
+}
+
+export interface PaginatedTaskList {
+  items: TaskInfo[]
+  pagination: PaginationInfo
 }
 
 export interface ObjectiveInfo {
@@ -197,6 +254,30 @@ export interface GroupChatMessage {
   intent?: string
   priority?: string
   envelope_id?: string
+  conversation_id?: string
+  error?: {
+    code: string
+    detail?: string
+    raw?: string
+  }
+}
+
+export interface Conversation {
+  id: string
+  workspace_id: string
+  name: string
+  is_blackboard_group: boolean
+  member_node_ids: string[]
+  last_message_at: string | null
+  last_message_preview: string | null
+  created_at: string | null
+}
+
+export interface ChatHistoryQuery {
+  limit?: number
+  q?: string
+  fromAt?: string
+  toAt?: string
 }
 
 export interface ScheduleInfo {
@@ -206,7 +287,17 @@ export interface ScheduleInfo {
   cron_expr: string
   message_template: string
   is_active: boolean
+  timeout_minutes: number
+  consecutive_failures: number
+  last_succeeded_at: string | null
   created_at: string | null
+}
+
+export interface PresetTemplate {
+  name: string
+  label: string
+  cron_expr: string
+  message_template: string
 }
 
 export type ChatSSECallback = (event: string, data: Record<string, unknown>) => void
@@ -234,6 +325,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const currentWorkspace = ref<WorkspaceInfo | null>(null)
   const blackboard = ref<BlackboardInfo | null>(null)
   const schedules = ref<ScheduleInfo[]>([])
+  const taskEventVersion = ref(0)
+  const lastTaskEvent = ref<{ workspace_id: string; event: string } | null>(null)
+  const schedulePresets = ref<PresetTemplate[]>([])
   const members = ref<WorkspaceMemberInfo[]>([])
   const loading = ref(false)
 
@@ -321,8 +415,74 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     return res.data.data as WorkspaceTemplateItem[]
   }
 
-  async function saveAsTemplate(data: { name: string; description?: string; workspace_id: string; visibility?: string }) {
+  async function saveAsTemplate(data: { name: string; description?: string; workspace_id: string; visibility?: string; excluded_agent_indices?: number[]; excluded_corridor_coords?: number[][] }) {
     const res = await api.post('/workspaces/templates', data)
+    return res.data.data
+  }
+
+  async function deleteTemplate(templateId: string) {
+    const res = await api.delete(`/workspaces/templates/${templateId}`)
+    return res.data
+  }
+
+  async function updateTemplate(templateId: string, data: { workspace_id: string; name?: string; description?: string; excluded_agent_indices?: number[]; excluded_corridor_coords?: number[][] }) {
+    const res = await api.put(`/workspaces/templates/${templateId}`, data)
+    return res.data.data
+  }
+
+  async function findTemplateBySourceWorkspace(workspaceId: string): Promise<WorkspaceTemplateItem | null> {
+    const templates = await fetchWorkspaceTemplates('org_private')
+    const direct = templates.find(t => t.source_workspace_id === workspaceId)
+    if (direct) return direct
+    const ws = currentWorkspace.value
+    if (ws?.source_template_id) {
+      const fromTemplate = templates.find(t => t.id === ws.source_template_id)
+      if (fromTemplate) return fromTemplate
+    }
+    return null
+  }
+
+  const activeTemplateDeploys = ref<ActiveWorkspaceDeployItem[]>([])
+
+  async function refreshActiveTemplateDeploys() {
+    try {
+      activeTemplateDeploys.value = await fetchActiveWorkspaceDeploys()
+    } catch {
+      activeTemplateDeploys.value = []
+    }
+    return activeTemplateDeploys.value
+  }
+
+  async function fetchTemplateCollectPreview(workspaceId: string) {
+    const res = await api.get('/workspaces/templates/collect-preview', {
+      params: { workspace_id: workspaceId },
+    })
+    return res.data.data as TemplateCollectPreview
+  }
+
+  async function fetchWorkspaceTemplateDetail(id: string) {
+    const res = await api.get(`/workspaces/templates/${id}`)
+    return res.data.data as WorkspaceTemplateDetail
+  }
+
+  async function deployWorkspaceFromTemplate(templateId: string, workspaceName: string, clusterId: string, selectedAgentIndices?: number[], excludedCorridorCoords?: number[][]) {
+    const body: Record<string, unknown> = {
+      workspace_name: workspaceName,
+      cluster_id: clusterId,
+    }
+    if (selectedAgentIndices) body.selected_agent_indices = selectedAgentIndices
+    if (excludedCorridorCoords?.length) body.excluded_corridor_coords = excludedCorridorCoords
+    const res = await api.post(`/workspaces/templates/${templateId}/deploy`, body)
+    return res.data.data as { workspace_deploy_id: string; workspace_id: string }
+  }
+
+  async function fetchActiveWorkspaceDeploys() {
+    const res = await api.get('/workspaces/deploys/active')
+    return res.data.data as ActiveWorkspaceDeployItem[]
+  }
+
+  async function fetchWorkspaceDeploy(deployId: string) {
+    const res = await api.get(`/workspaces/deploys/${deployId}`)
     return res.data.data
   }
 
@@ -356,7 +516,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   async function removeAgent(workspaceId: string, instanceId: string) {
-    await api.delete(`/workspaces/${workspaceId}/agents/${instanceId}`)
+    try {
+      await api.delete(`/workspaces/${workspaceId}/agents/${instanceId}`)
+    } catch (err: any) {
+      if (err?.response?.status !== 404) throw err
+    }
     if (currentWorkspace.value?.id === workspaceId) {
       await fetchWorkspace(workspaceId)
     }
@@ -371,6 +535,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   async function updateAgentThemeColor(workspaceId: string, instanceId: string, color: string) {
     await updateAgent(workspaceId, instanceId, { theme_color: color })
+  }
+
+  async function restartAllInstances(workspaceId: string) {
+    const res = await api.post(`/workspaces/${workspaceId}/restart-all-instances`)
+    return res.data.data as { total: number; succeeded: number; failed: number; skipped: number; details: unknown[] }
   }
 
   // ── Blackboard ────────────────────────────────────
@@ -390,26 +559,54 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     blackboard.value = res.data.data
   }
 
-  async function fetchTasks(workspaceId: string, status?: string, excludeArchived = true) {
-    const params = new URLSearchParams()
-    if (status) params.set('status', status)
-    if (!excludeArchived) params.set('exclude_archived', 'false')
-    const res = await api.get(`/workspaces/${workspaceId}/blackboard/tasks?${params.toString()}`)
+  async function fetchTasks(workspaceId: string, status?: string) {
+    const params: Record<string, string> = {}
+    if (status) params.status = status
+    const res = await api.get(`/workspaces/${workspaceId}/blackboard/tasks`, { params })
     return (res.data.data || []) as TaskInfo[]
+  }
+
+  async function fetchTasksPaginated(
+    workspaceId: string,
+    options: {
+      status?: string
+      bucket?: 'active' | 'inactive' | 'column'
+      page?: number
+      pageSize?: number
+    } = {},
+  ) {
+    const params: Record<string, string | number | boolean> = {
+      paginated: true,
+      bucket: options.bucket || 'active',
+      page: options.page || 1,
+      page_size: options.pageSize || 20,
+    }
+    if (options.status) params.status = options.status
+    const res = await api.get(`/workspaces/${workspaceId}/blackboard/tasks`, { params })
+    return {
+      items: (res.data.data || []) as TaskInfo[],
+      pagination: (res.data.pagination || {
+        page: options.page || 1,
+        page_size: options.pageSize || 20,
+        total: 0,
+      }) as PaginationInfo,
+    } satisfies PaginatedTaskList
+  }
+
+  function notifyTaskEvent(workspaceId: string, event: string) {
+    lastTaskEvent.value = { workspace_id: workspaceId, event }
+    taskEventVersion.value += 1
   }
 
   async function createTask(workspaceId: string, data: { title: string; description?: string; priority?: string; assignee_id?: string; estimated_value?: number }) {
     const res = await api.post(`/workspaces/${workspaceId}/blackboard/tasks`, data)
+    notifyTaskEvent(workspaceId, 'task:created')
     return res.data.data as TaskInfo
   }
 
   async function updateTask(workspaceId: string, taskId: string, data: Record<string, unknown>) {
     const res = await api.put(`/workspaces/${workspaceId}/blackboard/tasks/${taskId}`, data)
-    return res.data.data as TaskInfo
-  }
-
-  async function archiveTask(workspaceId: string, taskId: string) {
-    const res = await api.post(`/workspaces/${workspaceId}/blackboard/tasks/${taskId}/archive`)
+    notifyTaskEvent(workspaceId, 'task:updated')
     return res.data.data as TaskInfo
   }
 
@@ -434,6 +631,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     try {
       const res = await api.get(`/workspaces/${workspaceId}/schedules`)
       schedules.value = (res.data.data?.schedules || []) as ScheduleInfo[]
+      schedulePresets.value = (res.data.data?.presets || []) as PresetTemplate[]
     } catch (e) {
       console.error('fetchSchedules error:', e)
     }
@@ -443,6 +641,25 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     await api.put(`/workspaces/${workspaceId}/schedules/${scheduleId}`, { is_active: isActive })
     const idx = schedules.value.findIndex(s => s.id === scheduleId)
     if (idx >= 0) schedules.value[idx].is_active = isActive
+  }
+
+  async function createSchedule(workspaceId: string, data: {
+    name: string; cron_expr: string; message_template: string; is_active?: boolean; timeout_minutes?: number
+  }) {
+    await api.post(`/workspaces/${workspaceId}/schedules`, data)
+    await fetchSchedules(workspaceId)
+  }
+
+  async function updateSchedule(workspaceId: string, scheduleId: string, data: {
+    name?: string; cron_expr?: string; message_template?: string; is_active?: boolean; timeout_minutes?: number
+  }) {
+    await api.put(`/workspaces/${workspaceId}/schedules/${scheduleId}`, data)
+    await fetchSchedules(workspaceId)
+  }
+
+  async function deleteSchedule(workspaceId: string, scheduleId: string) {
+    await api.delete(`/workspaces/${workspaceId}/schedules/${scheduleId}`)
+    await fetchSchedules(workspaceId)
   }
 
   // ── Performance ──────────────────────────────────────
@@ -459,6 +676,16 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   async function attributeTokens(workspaceId: string) {
     const res = await api.post(`/workspaces/${workspaceId}/performance/attribute-tokens`)
+    return res.data.data as Record<string, unknown>
+  }
+
+  async function fetchAgentPerformance(workspaceId: string, days = 30) {
+    const res = await api.get(`/workspaces/${workspaceId}/performance/agents`, { params: { days } })
+    return res.data.data as Record<string, unknown>
+  }
+
+  async function fetchGlobalAgentPerformance(days = 30) {
+    const res = await api.get('/users/me/agent-performance', { params: { days } })
     return res.data.data as Record<string, unknown>
   }
 
@@ -480,6 +707,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const typingAgents = ref<Map<string, string>>(new Map())
   const unreadCount = ref(0)
   const chatVisible = ref(false)
+  const conversations = ref<Conversation[]>([])
+  const activeConversationId = ref<string>('')
 
   function setChatVisible(visible: boolean) {
     chatVisible.value = visible
@@ -509,11 +738,50 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     } catch { /* ignore */ }
   }
 
-  async function fetchChatHistory(workspaceId: string) {
+  async function fetchConversations(workspaceId: string) {
     try {
-      const res = await api.get(`/workspaces/${workspaceId}/messages`, { params: { limit: 50 } })
+      const res = await api.get(`/workspaces/${workspaceId}/conversations`)
+      conversations.value = (res.data.data || []) as Conversation[]
+      if (conversations.value.length > 0 && !activeConversationId.value) {
+        activeConversationId.value = conversations.value[0].id
+      }
+    } catch (e) {
+      console.error('fetchConversations error:', e)
+    }
+  }
+
+  async function fetchConversationMessages(workspaceId: string, conversationId: string, limit = 50): Promise<GroupChatMessage[]> {
+    try {
+      const res = await api.get(`/workspaces/${workspaceId}/conversations/${conversationId}/messages`, {
+        params: { limit },
+      })
       const raw = res.data.data || []
-      chatMessages.value = raw.map((m: Record<string, unknown>) => ({
+      return raw.map((m: Record<string, unknown>) => ({
+        id: m.id as string,
+        sender_type: m.sender_type as 'user' | 'agent' | 'system',
+        sender_id: m.sender_id as string,
+        sender_name: m.sender_name as string,
+        content: m.content as string,
+        message_type: m.message_type as string,
+        created_at: m.created_at as string,
+        conversation_id: m.conversation_id as string | undefined,
+        attachments: (m.attachments as FileAttachment[]) || undefined,
+      }))
+    } catch (e) {
+      console.error('fetchConversationMessages error:', e)
+      throw e
+    }
+  }
+
+  async function fetchChatHistory(workspaceId: string, query?: ChatHistoryQuery) {
+    try {
+      const params: Record<string, unknown> = { limit: query?.limit ?? 50 }
+      if (query?.q?.trim()) params.q = query.q.trim()
+      if (query?.fromAt) params.from_at = query.fromAt
+      if (query?.toAt) params.to_at = query.toAt
+      const res = await api.get(`/workspaces/${workspaceId}/messages`, { params })
+      const raw = res.data.data || []
+      return raw.map((m: Record<string, unknown>) => ({
         id: m.id as string,
         sender_type: m.sender_type as 'user' | 'agent' | 'system',
         sender_id: m.sender_id as string,
@@ -525,6 +793,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       }))
     } catch (e) {
       console.error('fetchChatHistory error:', e)
+      throw e
     }
   }
 
@@ -534,6 +803,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     mentions?: string[],
     fileIds?: string[],
     attachments?: FileAttachment[],
+    conversationId?: string,
   ) {
     if (chatLoading.value) return
     chatLoading.value = true
@@ -548,6 +818,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       message_type: 'chat',
       created_at: new Date().toISOString(),
       attachments: attachments || undefined,
+      conversation_id: conversationId || activeConversationId.value || undefined,
     }
     chatMessages.value.push(userMsg)
 
@@ -555,9 +826,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       const body: Record<string, unknown> = { message }
       if (mentions && mentions.length > 0) body.mentions = mentions
       if (fileIds && fileIds.length > 0) body.file_ids = fileIds
+      const convId = conversationId || activeConversationId.value
+      if (convId) body.conversation_id = convId
       await api.post(`/workspaces/${workspaceId}/chat`, body)
     } catch (e) {
       console.error('sendWorkspaceMessage error:', e)
+      throw e
     } finally {
       chatLoading.value = false
     }
@@ -568,7 +842,15 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       await api.post(`/workspaces/${workspaceId}/system-message`, { content })
     } catch (e) {
       console.error('sendSystemMessage error:', e)
+      throw e
     }
+  }
+
+  async function clearChatHistory(workspaceId: string) {
+    await api.post(`/workspaces/${workspaceId}/messages/clear`)
+    chatMessages.value = []
+    typingAgents.value.clear()
+    unreadCount.value = 0
   }
 
   const _typingTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -611,6 +893,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         trace_id: data.trace_id as string | undefined,
         causation_id: data.causation_id as string | undefined,
         envelope_id: data.envelope_id as string | undefined,
+        conversation_id: data.conversation_id as string | undefined,
       })
       _incrementUnread()
     }
@@ -638,24 +921,35 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   function _handleAgentError(data: Record<string, unknown>) {
     const instanceId = data.instance_id as string
     const agentName = data.agent_name as string
+    const errorCode = (data.error as string) || 'unknown'
+    const errorDetail = (data.error_detail as string) || undefined
+    const errorRaw = (data.error_raw as string) || undefined
     typingAgents.value.delete(instanceId)
     _clearTypingTimer(instanceId)
+
+    const errorObj: GroupChatMessage['error'] = {
+      code: errorCode,
+      detail: errorDetail,
+      raw: errorRaw,
+    }
 
     const streaming = chatMessages.value.find(
       (m) => m.sender_id === instanceId && m.streaming,
     )
     if (streaming) {
       streaming.streaming = false
-      streaming.content += `\n[Error: ${data.error}]`
+      streaming.error = errorObj
     } else {
       chatMessages.value.push({
         id: `error-${instanceId}-${Date.now()}`,
         sender_type: 'agent',
         sender_id: instanceId,
         sender_name: agentName,
-        content: `[Error: ${data.error}]`,
+        content: '',
         message_type: 'chat',
         created_at: new Date().toISOString(),
+        error: errorObj,
+        conversation_id: data.conversation_id as string | undefined,
       })
     }
   }
@@ -673,6 +967,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
     if (_isDuplicateMessage(msgId)) return
 
+    const existingStreaming = chatMessages.value.find(
+      (m) => m.sender_id === instanceId && m.streaming,
+    )
+    if (existingStreaming) {
+      existingStreaming.streaming = false
+      existingStreaming.message_type = 'collaboration'
+      existingStreaming.content = content
+      existingStreaming.id = msgId
+      existingStreaming.intent = intent
+      existingStreaming.priority = priority
+      existingStreaming.envelope_id = data.envelope_id as string | undefined
+      return
+    }
+
     chatMessages.value.push({
       id: msgId,
       sender_type: 'agent',
@@ -681,11 +989,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       content,
       message_type: 'collaboration',
       created_at: new Date().toISOString(),
-      trace_id: data.trace_id as string | undefined,
+      trace_id: traceId,
       causation_id: data.causation_id as string | undefined,
-      intent: data.intent as string | undefined,
-      priority: data.priority as string | undefined,
+      intent,
+      priority,
       envelope_id: data.envelope_id as string | undefined,
+      conversation_id: data.conversation_id as string | undefined,
     })
     _incrementUnread()
   }
@@ -850,6 +1159,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       eventSource.addEventListener(evtName, (e: MessageEvent) => {
         try {
           const data = JSON.parse(e.data)
+          notifyTaskEvent(workspaceId, evtName)
           externalCallback?.(evtName, data)
         } catch { /* ignore */ }
       })
@@ -863,6 +1173,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         } catch { /* ignore */ }
       })
     }
+
+    eventSource.addEventListener('schedule:consecutive_failures', (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data)
+        externalCallback?.('schedule:consecutive_failures', data)
+        fetchSchedules(workspaceId)
+      } catch { /* ignore */ }
+    })
 
     for (const evtName of ['post:created', 'post:updated', 'post:deleted', 'post:pinned', 'reply:created', 'file:created', 'file:uploaded', 'file:deleted']) {
       eventSource.addEventListener(evtName, (e: MessageEvent) => {
@@ -889,9 +1207,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
               content: data.content as string,
               message_type: 'system',
               created_at: (data.created_at as string) || new Date().toISOString(),
+              conversation_id: (data.conversation_id as string) || undefined,
             })
           }
         }
+      } catch { /* ignore */ }
+    })
+
+    eventSource.addEventListener('chat:cleared', (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data)
+        externalCallback?.('chat:cleared', data)
+        chatMessages.value = []
+        typingAgents.value.clear()
+        unreadCount.value = 0
       } catch { /* ignore */ }
     })
 
@@ -1079,7 +1408,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   async function deleteCorridorHex(workspaceId: string, hexId: string) {
-    await api.delete(`/workspaces/${workspaceId}/corridor-hexes/${hexId}`)
+    try {
+      await api.delete(`/workspaces/${workspaceId}/corridor-hexes/${hexId}`)
+    } catch (err: any) {
+      if (err?.response?.status !== 404) throw err
+    }
     corridorHexes.value = corridorHexes.value.filter(c => c.id !== hexId)
     await fetchTopology(workspaceId)
   }
@@ -1150,7 +1483,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   async function deleteHumanHex(workspaceId: string, hexId: string) {
-    await api.delete(`/workspaces/${workspaceId}/human-hexes/${hexId}`)
+    try {
+      await api.delete(`/workspaces/${workspaceId}/human-hexes/${hexId}`)
+    } catch (err: any) {
+      if (err?.response?.status !== 404) throw err
+    }
     await fetchTopology(workspaceId)
   }
 
@@ -1217,9 +1554,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     currentWorkspace.value = null
     blackboard.value = null
     schedules.value = []
+    taskEventVersion.value = 0
+    lastTaskEvent.value = null
+    schedulePresets.value = []
     topology.value = null
     members.value = []
     chatMessages.value = []
+    conversations.value = []
+    activeConversationId.value = ''
     corridorHexes.value = []
     connections.value = []
     heatmap.value = []
@@ -1235,6 +1577,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     currentWorkspace,
     blackboard,
     schedules,
+    taskEventVersion,
+    lastTaskEvent,
     members,
     loading,
     chatMessages,
@@ -1265,6 +1609,16 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     createWorkspace,
     fetchWorkspaceTemplates,
     saveAsTemplate,
+    deleteTemplate,
+    updateTemplate,
+    findTemplateBySourceWorkspace,
+    fetchTemplateCollectPreview,
+    activeTemplateDeploys,
+    refreshActiveTemplateDeploys,
+    fetchWorkspaceTemplateDetail,
+    deployWorkspaceFromTemplate,
+    fetchActiveWorkspaceDeploys,
+    fetchWorkspaceDeploy,
     updateWorkspace,
     deleteWorkspace,
     addAgent,
@@ -1274,21 +1628,32 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     fetchBlackboard,
     updateBlackboard,
     fetchTasks,
+    fetchTasksPaginated,
     createTask,
     updateTask,
-    archiveTask,
     fetchObjectives,
     createObjective,
     updateObjective,
+    schedulePresets,
     fetchSchedules,
     toggleScheduleActive,
+    createSchedule,
+    updateSchedule,
+    deleteSchedule,
     fetchPerformance,
     collectPerformance,
     attributeTokens,
+    fetchAgentPerformance,
+    fetchGlobalAgentPerformance,
     fetchMembers,
+    conversations,
+    activeConversationId,
+    fetchConversations,
+    fetchConversationMessages,
     fetchChatHistory,
     sendWorkspaceMessage,
     sendSystemMessage,
+    clearChatHistory,
     connectSSE,
     disconnectSSE,
     sendMessage,
@@ -1316,5 +1681,6 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     updateMember,
     removeMember,
     searchOrgUsers,
+    restartAllInstances,
   }
 })

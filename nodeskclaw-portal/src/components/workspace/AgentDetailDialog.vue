@@ -12,6 +12,8 @@ import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import type { InstanceSkillItem, InstanceGeneItem, GenomeItem } from '@/stores/gene'
 import { getRuntimeCaps } from '@/utils/runtimeCapabilities'
+import { copyToClipboard } from '@/utils/clipboard'
+import { formatDate } from '@/utils/localeFormat'
 
 const props = defineProps<{
   visible: boolean
@@ -24,7 +26,7 @@ const emit = defineEmits<{
   deleted: []
 }>()
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const toast = useToast()
 const router = useRouter()
 const { confirm } = useConfirm()
@@ -196,12 +198,14 @@ async function fetchGenes() {
 }
 
 async function copyToken() {
-  try {
-    await navigator.clipboard.writeText(gatewayToken.value)
+  const ok = await copyToClipboard(gatewayToken.value)
+  if (ok) {
     tokenCopied.value = true
     toast.success(t('agentDetailDialog.tokenCopied'))
     setTimeout(() => { tokenCopied.value = false }, 2000)
-  } catch { /* ignore */ }
+  } else {
+    toast.error(t('common.copyFailed'))
+  }
 }
 
 function stopPolling() {
@@ -421,7 +425,7 @@ onUnmounted(stopPolling)
                   </div>
                   <div>
                     <span class="text-muted-foreground text-xs">{{ t('agentDetailDialog.createdAt') }}</span>
-                    <span class="ml-1.5 text-xs">{{ new Date(instance.created_at).toLocaleDateString('zh-CN') }}</span>
+                    <span class="ml-1.5 text-xs">{{ formatDate(instance.created_at, String(locale)) }}</span>
                   </div>
                 </div>
               </div>

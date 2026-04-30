@@ -8,13 +8,24 @@
     "bind": "${OPENCLAW_GATEWAY_BIND}",
     "auth": {
       "mode": "token",
-      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+      "token": "${OPENCLAW_GATEWAY_TOKEN}",
+      "rateLimit": {
+        "maxAttempts": 10,
+        "windowMs": 60000,
+        "lockoutMs": 300000
+      }
     },
     "controlUi": {
       "enabled": true,
-      "allowInsecureAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true,
       "dangerouslyDisableDeviceAuth": true
+    }
+  },
+
+  "tools": {
+    "exec": {
+      "security": "full",
+      "ask": "off"
     }
   },
 

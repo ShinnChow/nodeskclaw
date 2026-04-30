@@ -3,11 +3,16 @@ import { ref, computed, onMounted, onUnmounted, inject, type Ref, type ComputedR
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import {
-  RefreshCw, Trash2, Circle, Loader2, Copy, Check, RotateCcw, AlertTriangle, FileText, X,
+  RefreshCw, Trash2, Circle, Loader2, Copy, Check, RotateCcw, AlertTriangle,
+  Wrench, Archive, CopyPlus, ChevronDown, ChevronRight, Save,
 } from 'lucide-vue-next'
 import api from '@/services/api'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
+import { getStatusDisplay } from '@/utils/instanceStatus'
+import { copyToClipboard } from '@/utils/clipboard'
+import { formatDateTime, formatNumber } from '@/utils/localeFormat'
+import { buildEngineInfoMap } from '@/utils/instanceFlow'
 
 const router = useRouter()
 const toast = useToast()
@@ -30,6 +35,7 @@ interface InstanceDetail {
   name: string
   status: string
   health_status?: string
+  display_status?: string
   image_version: string
   ingress_domain: string | null
   namespace: string
@@ -58,11 +64,7 @@ interface EngineInfo {
   poweredBy: string
   tags: string[]
 }
-const ENGINE_INFO: Record<string, EngineInfo> = {
-  openclaw: { name: '全能工作引擎', description: '支持工具调用、基因系统、多技能管理', poweredBy: 'OpenClaw', tags: ['默认'] },
-  zeroclaw: { name: '高性能工作引擎', description: 'Rust 构建，极速响应，适合高并发场景', poweredBy: 'ZeroClaw', tags: [] },
-  nanobot:  { name: '轻量工作引擎', description: '超轻量，快速部署，适合简单对话场景', poweredBy: 'Nanobot', tags: [] },
-}
+const ENGINE_INFO: Record<string, EngineInfo> = buildEngineInfoMap(t)
 const engineInfo = computed(() => ENGINE_INFO[instance.value?.runtime ?? 'openclaw'] ?? null)
 const loading = ref(true)
 const pageError = ref('')
@@ -72,35 +74,63 @@ const restarting = ref(false)
 const resettingToken = ref(false)
 const showRestartDialog = ref(false)
 const showDeleteDialog = ref(false)
+const showCloneDialog = ref(false)
 const deleting = ref(false)
-const logsVisible = ref(false)
-const logsContent = ref('')
-const logsLoading = ref(false)
+const cloneName = ref('')
+const cloning = ref(false)
 
-async function viewLogs(podName: string) {
-  if (logsVisible.value) {
-    logsVisible.value = false
-    return
-  }
-  logsLoading.value = true
-  logsContent.value = ''
+async function handleBackup() {
   try {
-    const res = await api.get(`/api/v1/instances/${instanceId.value}/pods/${podName}/logs`, { params: { tail: 100 } })
-    logsContent.value = res.data?.logs || res.data || ''
-    logsVisible.value = true
-  } catch {
-    toast.error(t('instanceDetail.logsLoadFailed'))
-  } finally {
-    logsLoading.value = false
+    await api.post(`/instances/${instanceId.value}/backups`)
+    toast.success(t('backup.backupSuccess'))
+    router.push({ name: 'InstanceBackups', params: { id: instanceId.value } })
+  } catch (e: any) {
+    toast.error(e?.response?.data?.message || t('common.failed'))
   }
 }
 
+async function handleRebuild() {
+  const ok = await confirm({
+    title: t('backup.rebuild'),
+    description: t('backup.confirmRebuild'),
+  })
+  if (!ok) return
+  try {
+    const { data } = await api.post(`/instances/${instanceId.value}/rebuild`)
+    toast.success(t('backup.rebuildSuccess'))
+    if (data.data?.deploy_id) {
+      router.push({ name: 'DeployProgress', params: { deployId: data.data.deploy_id } })
+    }
+  } catch (e: any) {
+    toast.error(e?.response?.data?.message || t('common.failed'))
+  }
+}
+
+async function handleClone() {
+  cloning.value = true
+  try {
+    const { data } = await api.post(`/instances/${instanceId.value}/clone`, { name: cloneName.value.trim() })
+    toast.success(t('backup.cloneSuccess'))
+    showCloneDialog.value = false
+    cloneName.value = ''
+    if (data.data?.deploy_id) {
+      router.push({ name: 'DeployProgress', params: { deployId: data.data.deploy_id } })
+    }
+  } catch (e: any) {
+    toast.error(e?.response?.data?.message || t('common.failed'))
+  } finally {
+    cloning.value = false
+  }
+}
 function formatCpu(val: string): string {
   if (val.endsWith('m')) {
     const cores = parseInt(val.slice(0, -1), 10) / 1000
-    return Number.isInteger(cores) ? `${cores} 核` : `${cores.toFixed(2)} 核`
+    const formatted = Number.isInteger(cores)
+      ? formatNumber(cores, String(locale.value))
+      : formatNumber(cores, String(locale.value), { maximumFractionDigits: 2, minimumFractionDigits: 0 })
+    return `${formatted} ${t('orgSettings.specsCpuUnit')}`
   }
-  return `${val} 核`
+  return `${val} ${t('orgSettings.specsCpuUnit')}`
 }
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
@@ -119,12 +149,14 @@ function syncGatewayToken(detail: InstanceDetail | null) {
 }
 
 async function copyToken() {
-  try {
-    await navigator.clipboard.writeText(gatewayToken.value)
+  const ok = await copyToClipboard(gatewayToken.value)
+  if (ok) {
     tokenCopied.value = true
     toast.success(t('agentDetailDialog.tokenCopied'))
     setTimeout(() => { tokenCopied.value = false }, 2000)
-  } catch { /* ignore */ }
+  } else {
+    toast.error(t('common.copyFailed'))
+  }
 }
 
 onMounted(async () => {
@@ -176,7 +208,7 @@ async function pollOnce() {
     if (instance.value && instance.value.status !== 'restarting') {
       stopPolling()
       restarting.value = false
-      toast.success('重启完成，AI 员工已恢复运行')
+      toast.success(t('agentDetailDialog.restartDone'))
     }
   } catch {
     // 轮询期间忽略网络错误
@@ -189,7 +221,7 @@ function startPolling() {
   pollTimeout = setTimeout(() => {
     stopPolling()
     restarting.value = false
-    toast.error('重启超时，请手动刷新查看状态')
+    toast.error(t('agentDetailDialog.restartTimeout'))
   }, 120_000)
 }
 
@@ -203,12 +235,12 @@ async function handleRestart() {
   restarting.value = true
   try {
     const res = await api.post(`/instances/${instanceId.value}/restart`)
-    toast.success(res.data?.message || '已触发重启，AI 员工将在数秒后恢复')
+    toast.success(res.data?.message || t('instanceDetail.restartTriggered'))
     await refreshInstanceBasic()
     startPolling()
   } catch (e: any) {
     restarting.value = false
-    const msg = e?.response?.data?.message || e?.message || '重启失败'
+    const msg = e?.response?.data?.message || e?.message || t('agentDetailDialog.restartFailed')
     toast.error(msg)
     console.error('[handleRestart]', e)
   }
@@ -257,11 +289,91 @@ async function handleDelete() {
   deleting.value = true
   try {
     await api.delete(`/instances/${instanceId.value}`)
-    toast.success('AI 员工已删除')
+    toast.success(t('agentDetailDialog.deleted'))
     router.push('/instances')
   } catch (e: any) {
     deleting.value = false
-    toast.error(e?.response?.data?.message || '删除失败')
+    toast.error(e?.response?.data?.message || t('agentDetailDialog.deleteFailed'))
+  }
+}
+
+interface SkillItem {
+  skill_name: string
+  name: string
+  description: string
+  type: string
+}
+
+const skillEditorOpen = ref(false)
+const skills = ref<SkillItem[]>([])
+const activeSkill = ref('')
+const skillContent = ref('')
+const skillOriginal = ref('')
+const skillLoading = ref(false)
+const skillSaving = ref(false)
+const skillDirty = computed(() => skillContent.value !== skillOriginal.value)
+
+async function fetchSkills() {
+  try {
+    const res = await api.get(`/instances/${instanceId.value}/skills`)
+    skills.value = (res.data?.data ?? [])
+      .filter((s: any) => s.type === 'emerged')
+      .map((s: any) => ({
+        skill_name: s.skill_name,
+        name: s.name || s.skill_name,
+        description: s.description || '',
+        type: s.type,
+      }))
+    if (skills.value.length && !activeSkill.value) {
+      activeSkill.value = skills.value[0].skill_name
+      await fetchSkillContent(activeSkill.value)
+    }
+  } catch {
+    skills.value = []
+  }
+}
+
+async function fetchSkillContent(name: string) {
+  skillLoading.value = true
+  try {
+    const res = await api.get(`/instances/${instanceId.value}/skills/${name}/content`)
+    skillContent.value = res.data?.data?.content ?? ''
+    skillOriginal.value = skillContent.value
+  } catch {
+    toast.error(t('instanceDetail.skillEditor.loadFailed'))
+    skillContent.value = ''
+    skillOriginal.value = ''
+  } finally {
+    skillLoading.value = false
+  }
+}
+
+async function selectSkill(name: string) {
+  if (name === activeSkill.value) return
+  activeSkill.value = name
+  await fetchSkillContent(name)
+}
+
+async function saveSkillContent() {
+  if (!activeSkill.value || skillSaving.value) return
+  skillSaving.value = true
+  try {
+    await api.put(`/instances/${instanceId.value}/skills/${activeSkill.value}/content`, {
+      content: skillContent.value,
+    })
+    skillOriginal.value = skillContent.value
+    toast.success(t('instanceDetail.skillEditor.saved'))
+  } catch {
+    toast.error(t('instanceDetail.skillEditor.saveFailed'))
+  } finally {
+    skillSaving.value = false
+  }
+}
+
+function toggleSkillEditor() {
+  skillEditorOpen.value = !skillEditorOpen.value
+  if (skillEditorOpen.value && !skills.value.length) {
+    fetchSkills()
   }
 }
 </script>
@@ -309,22 +421,22 @@ async function handleDelete() {
 
       <!-- 基本信息 -->
       <div class="p-4 rounded-xl border border-border bg-card">
-        <h2 class="text-sm font-medium mb-3">基本信息</h2>
+        <h2 class="text-sm font-medium mb-3">{{ t('agentDetailDialog.basicInfo') }}</h2>
         <div class="grid grid-cols-2 gap-4 text-sm">
           <div>
-            <span class="text-muted-foreground">镜像版本</span>
+            <span class="text-muted-foreground">{{ t('agentDetailDialog.imageVersion') }}</span>
             <span class="ml-2 font-mono text-xs bg-muted px-1.5 py-0.5 rounded">{{ instance.image_version }}</span>
           </div>
           <div>
-            <span class="text-muted-foreground">CPU</span>
+            <span class="text-muted-foreground">{{ t('agentDetailDialog.cpu') }}</span>
             <span class="ml-2">{{ formatCpu(instance.cpu_limit) }}</span>
           </div>
           <div>
-            <span class="text-muted-foreground">内存</span>
+            <span class="text-muted-foreground">{{ t('agentDetailDialog.memory') }}</span>
             <span class="ml-2">{{ instance.mem_limit }}</span>
           </div>
           <div>
-            <span class="text-muted-foreground">存储</span>
+            <span class="text-muted-foreground">{{ t('orgUsage.storage') }}</span>
             <span class="ml-2">{{ instance.storage_size }}</span>
           </div>
           <div v-if="instance.runtime" class="col-span-2">
@@ -349,8 +461,30 @@ async function handleDelete() {
             </span>
           </div>
           <div class="col-span-2">
-            <span class="text-muted-foreground">创建时间</span>
-            <span class="ml-2">{{ new Date(instance.created_at).toLocaleString('zh-CN') }}</span>
+            <span class="text-muted-foreground">{{ t('agentDetailDialog.createdAt') }}</span>
+            <span class="ml-2">{{ formatDateTime(instance.created_at, String(locale)) }}</span>
+          </div>
+          <div class="col-span-2">
+            <span class="text-muted-foreground">{{ t('instanceDetail.workStatus') }}</span>
+            <span class="ml-2 inline-flex items-center gap-1.5">
+              <Circle
+                class="w-2 h-2 fill-current"
+                :class="[
+                  getStatusDisplay(instance.display_status ?? '').bgColor.replace('bg-', 'text-'),
+                  getStatusDisplay(instance.display_status ?? '').pulse ? 'animate-pulse' : '',
+                ]"
+              />
+              <span :class="getStatusDisplay(instance.display_status ?? '').color">
+                {{ t('displayStatus.' + getStatusDisplay(instance.display_status ?? '').key + '_desc') }}
+              </span>
+              <router-link
+                v-if="getStatusDisplay(instance.display_status ?? '').key === 'error'"
+                :to="{ name: 'InstanceRuntime', params: { id: instance.id } }"
+                class="text-xs text-primary hover:underline ml-1"
+              >
+                {{ t('common.runtimeStatus') }}
+              </router-link>
+            </span>
           </div>
           <div v-if="instance.endpoint_url" class="col-span-2">
             <span class="text-muted-foreground">{{ t('instanceDetail.endpointUrl') }}</span>
@@ -364,64 +498,21 @@ async function handleDelete() {
         </div>
       </div>
 
-      <!-- Pod / 容器状态 -->
-      <div v-if="instance.pods?.length" class="p-4 rounded-xl border border-border bg-card">
-        <h2 class="text-sm font-medium mb-3">{{ isDocker ? t('instanceDetail.aiEmployeeStatus') : t('instanceDetail.podStatus') }}</h2>
-        <div class="space-y-2">
-          <div
-            v-for="pod in instance.pods"
-            :key="pod.name"
-            class="flex items-center justify-between text-sm p-2 rounded-md bg-muted/30"
-          >
-            <div class="flex items-center gap-2">
-              <Circle
-                class="w-2 h-2 fill-current"
-                :class="instance.health_status === 'unhealthy' ? 'text-orange-400' : (pod.ready ? 'text-green-400' : 'text-yellow-400')"
-              />
-              <span class="font-mono text-xs">{{ pod.name }}</span>
-              <span v-if="instance.status === 'running' && instance.health_status === 'unhealthy'" class="text-[10px] text-orange-400">
-                {{ t('status.running_unhealthy') }}
-              </span>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="text-xs text-muted-foreground">
-                重启 {{ pod.restart_count }} 次
-              </span>
-              <button
-                class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                @click="viewLogs(pod.name)"
-              >
-                <FileText class="w-3 h-3" />
-                {{ t('instanceDetail.viewLogs') }}
-              </button>
-            </div>
-          </div>
-        </div>
-        <div v-if="logsVisible" class="mt-3 border border-border rounded-lg overflow-hidden">
-          <div class="flex items-center justify-between px-3 py-1.5 bg-muted/50 border-b border-border">
-            <span class="text-xs font-medium">{{ t('instanceDetail.viewLogs') }}</span>
-            <button class="text-muted-foreground hover:text-foreground" @click="logsVisible = false">
-              <X class="w-3.5 h-3.5" />
-            </button>
-          </div>
-          <pre class="p-3 text-xs font-mono leading-relaxed overflow-auto max-h-64 bg-black/30 text-foreground">{{ logsContent || '...' }}</pre>
-        </div>
-      </div>
-      <div v-else-if="restarting" class="p-4 rounded-xl border border-amber-500/20 bg-amber-500/5">
+      <div v-if="restarting" class="p-4 rounded-xl border border-amber-500/20 bg-amber-500/5">
         <div class="flex items-center gap-2 text-sm text-amber-400">
           <Loader2 class="w-4 h-4 animate-spin" />
-          AI 员工正在重启，等待新 Pod 启动...
+          {{ t('displayStatus.restarting_desc') }}
         </div>
       </div>
 
       <!-- 操作 -->
-      <div class="flex items-center gap-3 pt-4 border-t border-border">
+      <div class="flex items-center gap-3 pt-4 border-t border-border flex-wrap">
         <button
           class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-border text-sm hover:bg-card transition-colors"
           @click="fetchDetail"
         >
           <RefreshCw class="w-4 h-4" />
-          刷新
+          {{ t('agentDetailDialog.refresh') }}
         </button>
         <button
           v-if="canEdit"
@@ -430,7 +521,31 @@ async function handleDelete() {
           @click="showRestartDialog = true"
         >
           <RotateCcw class="w-4 h-4" :class="restarting ? 'animate-spin' : ''" />
-          {{ restarting ? '重启中...' : '重启AI 员工' }}
+          {{ restarting ? t('agentDetailDialog.restarting') : t('agentDetailDialog.restart') }}
+        </button>
+        <button
+          v-if="canEdit && instance?.status === 'running'"
+          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-border text-sm hover:bg-card transition-colors"
+          @click="handleBackup"
+        >
+          <Archive class="w-4 h-4" />
+          {{ t('backup.create') }}
+        </button>
+        <button
+          v-if="canAdmin && instance?.status === 'running'"
+          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-border text-sm hover:bg-card transition-colors"
+          @click="showCloneDialog = true"
+        >
+          <CopyPlus class="w-4 h-4" />
+          {{ t('backup.clone') }}
+        </button>
+        <button
+          v-if="canAdmin && (instance?.status === 'failed' || instance?.health_status === 'unhealthy')"
+          class="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-amber-500/30 text-amber-400 text-sm hover:bg-amber-500/10 transition-colors"
+          @click="handleRebuild"
+        >
+          <Wrench class="w-4 h-4" />
+          {{ t('backup.rebuild') }}
         </button>
         <button
           v-if="canAdmin"
@@ -440,9 +555,111 @@ async function handleDelete() {
         >
           <Loader2 v-if="deleting" class="w-4 h-4 animate-spin" />
           <Trash2 v-else class="w-4 h-4" />
-          {{ deleting ? '删除中...' : '删除AI 员工' }}
+          {{ deleting ? t('agentDetailDialog.deleting') : t('agentDetailDialog.delete') }}
         </button>
       </div>
+
+      <!-- 角色与提示词 -->
+      <div class="rounded-xl border border-border bg-card overflow-hidden">
+        <button
+          class="flex items-center justify-between w-full px-4 py-3 text-left hover:bg-muted/30 transition-colors"
+          @click="toggleSkillEditor"
+        >
+          <div class="flex items-center gap-2">
+            <ChevronRight v-if="!skillEditorOpen" class="w-4 h-4 text-muted-foreground" />
+            <ChevronDown v-else class="w-4 h-4 text-muted-foreground" />
+            <span class="text-sm font-medium">{{ t('instanceDetail.skillEditor.title') }}</span>
+            <span
+              v-if="skills.length"
+              class="text-xs px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground"
+            >{{ skills.length }}</span>
+          </div>
+        </button>
+
+        <div v-if="skillEditorOpen" class="border-t border-border">
+          <div v-if="!skills.length && !skillLoading" class="px-4 py-8 text-center text-sm text-muted-foreground">
+            {{ t('instanceDetail.skillEditor.empty') }}
+          </div>
+          <template v-else>
+            <div class="flex gap-1 px-4 pt-3 pb-0 overflow-x-auto">
+              <button
+                v-for="s in skills"
+                :key="s.skill_name"
+                class="px-3 py-1.5 text-xs rounded-t-lg border border-b-0 transition-colors whitespace-nowrap"
+                :class="s.skill_name === activeSkill
+                  ? 'bg-card border-border text-foreground font-medium'
+                  : 'bg-transparent border-transparent text-muted-foreground hover:text-foreground hover:bg-muted/30'"
+                @click="selectSkill(s.skill_name)"
+              >{{ s.name }}</button>
+            </div>
+
+            <div class="px-4 pb-4">
+              <div v-if="skillLoading" class="flex items-center justify-center py-12">
+                <Loader2 class="w-5 h-5 animate-spin text-muted-foreground" />
+              </div>
+              <template v-else>
+                <textarea
+                  v-model="skillContent"
+                  class="w-full h-80 px-3 py-2 rounded-lg border border-border bg-background text-sm font-mono resize-y scrollbar-compact"
+                  :readonly="!canEdit"
+                  spellcheck="false"
+                />
+                <div class="flex items-center justify-between mt-2">
+                  <p class="text-xs text-muted-foreground">{{ t('instanceDetail.skillEditor.restartHint') }}</p>
+                  <button
+                    v-if="canEdit"
+                    class="flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    :class="skillDirty
+                      ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                      : 'border border-border text-muted-foreground'"
+                    :disabled="!skillDirty || skillSaving"
+                    @click="saveSkillContent"
+                  >
+                    <Loader2 v-if="skillSaving" class="w-3.5 h-3.5 animate-spin" />
+                    <Save v-else class="w-3.5 h-3.5" />
+                    {{ t('instanceDetail.skillEditor.save') }}
+                  </button>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- 克隆对话框 -->
+      <Teleport to="body">
+        <Transition name="fade">
+          <div v-if="showCloneDialog" class="fixed inset-0 z-50 flex items-center justify-center">
+            <div class="absolute inset-0 bg-black/50" @click="showCloneDialog = false" />
+            <div class="relative bg-card border border-border rounded-xl p-6 w-full max-w-sm shadow-lg space-y-4">
+              <h3 class="text-base font-semibold">{{ t('backup.clone') }}</h3>
+              <p class="text-sm text-muted-foreground">{{ t('backup.confirmClone') }}</p>
+              <div>
+                <label class="block text-sm mb-1.5">{{ t('backup.cloneNameLabel') }}</label>
+                <input
+                  v-model="cloneName"
+                  class="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm"
+                  :placeholder="t('backup.cloneNamePlaceholder')"
+                />
+              </div>
+              <div class="flex justify-end gap-2">
+                <button
+                  class="px-4 py-2 rounded-lg border border-border text-sm hover:bg-card transition-colors"
+                  @click="showCloneDialog = false"
+                >{{ t('common.cancel') }}</button>
+                <button
+                  class="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm hover:bg-primary/90 disabled:opacity-50"
+                  :disabled="!cloneName.trim() || cloning"
+                  @click="handleClone"
+                >
+                  <Loader2 v-if="cloning" class="w-4 h-4 animate-spin inline mr-1" />
+                  {{ t('backup.startClone') }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </Transition>
+      </Teleport>
     </div>
 
     <!-- 重启确认弹窗 -->
@@ -455,14 +672,14 @@ async function handleDelete() {
               <div class="p-2 rounded-lg bg-amber-500/10">
                 <AlertTriangle class="w-5 h-5 text-amber-400" />
               </div>
-              <h3 class="text-base font-semibold">重启AI 员工</h3>
+              <h3 class="text-base font-semibold">{{ t('agentDetailDialog.restartConfirmTitle') }}</h3>
             </div>
             <div class="text-sm text-muted-foreground space-y-2">
-              <p>即将重启AI 员工，这将会：</p>
+              <p>{{ t('instanceDetail.restartConfirmIntro') }}</p>
               <ul class="list-disc list-inside space-y-1 text-xs">
-                <li>关闭AI 员工中所有运行的程序</li>
-                <li>重启期间服务将短暂不可用</li>
-                <li>正在进行的对话和任务会被中断</li>
+                <li>{{ t('instanceDetail.restartImpactProcesses') }}</li>
+                <li>{{ t('instanceDetail.restartImpactAvailability') }}</li>
+                <li>{{ t('instanceDetail.restartImpactTasks') }}</li>
               </ul>
             </div>
             <div class="flex justify-end gap-3 pt-2">
@@ -470,13 +687,13 @@ async function handleDelete() {
                 class="px-4 py-2 rounded-lg border border-border text-sm hover:bg-muted transition-colors"
                 @click="showRestartDialog = false"
               >
-                取消
+                {{ t('common.cancel') }}
               </button>
               <button
                 class="px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:bg-amber-600 transition-colors"
                 @click="handleRestart"
               >
-                确认重启
+                {{ t('instanceDetail.confirmRestart') }}
               </button>
             </div>
           </div>
@@ -494,7 +711,7 @@ async function handleDelete() {
               <div class="p-2 rounded-lg bg-red-500/10">
                 <AlertTriangle class="w-5 h-5 text-red-400" />
               </div>
-              <h3 class="text-base font-semibold">删除AI 员工</h3>
+              <h3 class="text-base font-semibold">{{ t('agentDetailDialog.deleteConfirmTitle') }}</h3>
             </div>
             <div v-if="instance?.workspaces?.length" class="text-sm text-muted-foreground space-y-2">
               <p>{{ t('instanceDetail.cannotDeleteInWorkspaces', { names: joinNames(instance.workspaces.map(w => w.name)) }) }}</p>
@@ -511,11 +728,11 @@ async function handleDelete() {
               </div>
             </div>
             <div v-else class="text-sm text-muted-foreground space-y-2">
-              <p>确定删除AI 员工「<span class="text-foreground font-medium">{{ instanceBasic?.name }}</span>」？</p>
+              <p>{{ t('instanceDetail.deleteConfirmQuestion', { name: instanceBasic?.name }) }}</p>
               <ul class="list-disc list-inside space-y-1 text-xs">
-                <li>AI 员工及其{{ isDocker ? '容器' : ' K8s' }}资源将被永久删除</li>
-                <li>所有对话记录和办公室数据将丢失</li>
-                <li>此操作不可恢复</li>
+                <li>{{ t(isDocker ? 'instanceDetail.deleteImpactDocker' : 'instanceDetail.deleteImpactK8s') }}</li>
+                <li>{{ t('instanceDetail.deleteImpactData') }}</li>
+                <li>{{ t('instanceDetail.deleteImpactIrreversible') }}</li>
               </ul>
             </div>
             <div class="flex justify-end gap-3 pt-2">
@@ -530,7 +747,7 @@ async function handleDelete() {
                 class="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-600 transition-colors"
                 @click="handleDelete"
               >
-                确认删除
+                {{ t('common.delete') }}
               </button>
             </div>
           </div>

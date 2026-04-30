@@ -130,11 +130,12 @@ def build_pvc(
     storage_size: str,
     storage_class: str | None,
     labels: dict,
+    access_modes: list[str] | None = None,
 ) -> V1PersistentVolumeClaim:
     return V1PersistentVolumeClaim(
         metadata=V1ObjectMeta(name=name, namespace=namespace, labels=labels),
         spec=V1PersistentVolumeClaimSpec(
-            access_modes=["ReadWriteMany"],
+            access_modes=access_modes or ["ReadWriteOnce"],
             resources=V1ResourceRequirements(requests={"storage": storage_size}),
             storage_class_name=storage_class,
         ),
@@ -417,11 +418,16 @@ def _build_egress_rules(
     peer_namespaces: list[str],
     deny_cidrs: list[str],
     allow_ports: list[int],
+    platform_namespace: str = "nodeskclaw-system",
+    platform_host_endpoints: list[tuple[str, int]] | None = None,
 ) -> list[dict]:
-    """构建 Egress 规则列表（允许列表模式，未匹配流量默认拒绝）。"""
+    """构建 Egress 规则列表（允许列表模式，未匹配流量默认拒绝）。
+
+    platform_host_endpoints: 宿主机平台服务地址列表 [(ip, port), ...]，
+    当后端/LLM Proxy 不在 K8s 集群内时，需要通过 ipBlock 显式放行。
+    """
     rules: list[dict] = []
 
-    # 1. DNS — 仅允许 kube-system 的 53 端口
     rules.append({
         "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}}}],
         "ports": [
@@ -430,17 +436,14 @@ def _build_egress_rules(
         ],
     })
 
-    # 2. 平台服务 — nodeskclaw-system（LLM Proxy / Ingress Controller 等）
     rules.append({
-        "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "nodeskclaw-system"}}}],
+        "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": platform_namespace}}}],
     })
 
-    # 3. 同 Namespace 内 Pod 互访
     rules.append({
         "to": [{"podSelector": {}}],
     })
 
-    # 4. Peer Namespaces — 已配置的互访实例
     for ns in peer_namespaces:
         rules.append({
             "to": [{
@@ -449,7 +452,16 @@ def _build_egress_rules(
             }],
         })
 
-    # 5. 公网出站 — 排除内网 CIDR，限定端口
+    if platform_host_endpoints:
+        seen: dict[str, list[int]] = {}
+        for ip, port in platform_host_endpoints:
+            seen.setdefault(ip, []).append(port)
+        for ip, ports_list in seen.items():
+            rules.append({
+                "to": [{"ipBlock": {"cidr": f"{ip}/32"}}],
+                "ports": [{"protocol": "TCP", "port": p} for p in sorted(set(ports_list))],
+            })
+
     ip_block: dict = {"cidr": "0.0.0.0/0"}
     if deny_cidrs:
         ip_block["except"] = deny_cidrs
@@ -470,48 +482,51 @@ def build_network_policy(
     org_id: str | None = None,
     egress_deny_cidrs: list[str] | None = None,
     egress_allow_ports: list[int] | None = None,
+    platform_namespace: str = "nodeskclaw-system",
+    ingress_enabled: bool = True,
+    egress_enabled: bool = True,
+    ingress_allow_cidrs: list[str] | None = None,
+    platform_host_endpoints: list[tuple[str, int]] | None = None,
 ) -> dict:
     """Build NetworkPolicy for multi-tenant isolation + egress restriction.
 
-    Ingress 策略:
-    - 允许来自同 Namespace 内的 Pod 访问
-    - 允许来自 Ingress Controller 命名空间（nodeskclaw-system）的流量
-    - 允许同组织其他 Namespace 的流量（通过 peer_namespaces）
-    - 拒绝其他所有入站流量
-
-    Egress 策略:
-    - 允许 DNS（kube-system, 端口 53）
-    - 允许平台服务（nodeskclaw-system, 全端口）
-    - 允许同 Namespace 内 Pod 互访
-    - 允许 Peer Namespaces（已配置的互访实例）
-    - 允许公网出站（0.0.0.0/0 except deny_cidrs, 限 allow_ports）
-    - 拒绝其他所有出站流量
+    ingress_enabled / egress_enabled 控制 policyTypes 中包含哪些方向。
+    两个都为 False 时不应调用此函数（调用方负责跳过）。
     """
-    ingress_from: list[dict] = [
-        {"podSelector": {}},
-        {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "nodeskclaw-system"}}},
-    ]
-
-    for ns in peer_namespaces:
-        ingress_from.append({
-            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": ns}},
-            "podSelector": {"matchLabels": {"app.kubernetes.io/managed-by": MANAGED_BY}},
-        })
-
     policy_labels = dict(labels)
     if org_id:
         policy_labels["nodeskclaw.io/org-id"] = org_id
 
-    spec: dict = {
-        "podSelector": {},
-        "policyTypes": ["Ingress", "Egress"],
-        "ingress": [{"from": ingress_from}],
-        "egress": _build_egress_rules(
+    policy_types: list[str] = []
+    spec: dict = {"podSelector": {}}
+
+    if ingress_enabled:
+        policy_types.append("Ingress")
+        ingress_from: list[dict] = [
+            {"podSelector": {}},
+            {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": platform_namespace}}},
+        ]
+        for ns in peer_namespaces:
+            ingress_from.append({
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": ns}},
+                "podSelector": {"matchLabels": {"app.kubernetes.io/managed-by": MANAGED_BY}},
+            })
+        for cidr in (ingress_allow_cidrs or []):
+            if cidr.strip():
+                ingress_from.append({"ipBlock": {"cidr": cidr.strip()}})
+        spec["ingress"] = [{"from": ingress_from}]
+
+    if egress_enabled:
+        policy_types.append("Egress")
+        spec["egress"] = _build_egress_rules(
             peer_namespaces=peer_namespaces,
             deny_cidrs=egress_deny_cidrs or [],
             allow_ports=egress_allow_ports or [80, 443],
-        ),
-    }
+            platform_namespace=platform_namespace,
+            platform_host_endpoints=platform_host_endpoints,
+        )
+
+    spec["policyTypes"] = policy_types
 
     return {
         "apiVersion": "networking.k8s.io/v1",
@@ -620,20 +635,26 @@ def build_ingress(
 def build_external_name_service(
     cluster_id: str,
     external_name: str,
+    api_server_url: str | None = None,
 ) -> V1Service:
     """构建 ExternalName Service，用于 infra 网关代理到 inst 集群 ALB。
 
-    每个 inst 集群对应一个 ExternalName Service，部署在 infra 的 GATEWAY_NS。
+    每个物理 inst 集群对应一个 ExternalName Service，部署在 infra 的 GATEWAY_NS。
+    当提供 api_server_url 时，会添加 api-server-hash label 用于物理集群去重。
     """
+    labels: dict[str, str] = {
+        "app.kubernetes.io/managed-by": MANAGED_BY,
+        "nodeskclaw/proxy-type": "inst-cluster",
+        "nodeskclaw/cluster-id": cluster_id,
+    }
+    if api_server_url:
+        from app.services.k8s.proxy_helpers import compute_api_server_hash
+        labels["nodeskclaw/api-server-hash"] = compute_api_server_hash(api_server_url)
     return V1Service(
         metadata=V1ObjectMeta(
             name=f"proxy-inst-{cluster_id[:8]}",
             namespace=GATEWAY_NS,
-            labels={
-                "app.kubernetes.io/managed-by": MANAGED_BY,
-                "nodeskclaw/proxy-type": "inst-cluster",
-                "nodeskclaw/cluster-id": cluster_id,
-            },
+            labels=labels,
         ),
         spec=V1ServiceSpec(
             type="ExternalName",

@@ -7,6 +7,7 @@ is a single exec call to the target Pod — no temp dirs, no tar, no bulk sync.
 import base64
 import json
 import logging
+import pathlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -57,6 +58,20 @@ class PodFS:
         except Exception:
             return None
 
+    async def read_binary(self, path: str) -> bytes | None:
+        """Read a file as raw bytes via base64 encoding (exec channel cannot transmit raw binary)."""
+        try:
+            result = await self._k8s.exec_in_pod(
+                self._ns, self._pod,
+                ["bash", "-c", f"base64 '/root/{path}' 2>/dev/null"],
+                container=self._container,
+            )
+            if not result:
+                return None
+            return base64.b64decode(result)
+        except Exception:
+            return None
+
     async def write_text(self, path: str, content: str) -> None:
         """Write content to a file in the Pod (creates parent dirs)."""
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
@@ -102,7 +117,7 @@ class PodFS:
 
     async def exists(self, path: str) -> bool:
         try:
-            result = await self._k8s.exec_in_pod(
+            await self._k8s.exec_in_pod(
                 self._ns, self._pod,
                 ["test", "-e", f"/root/{path}"],
                 container=self._container,
@@ -259,7 +274,10 @@ class PodFS:
 
 async def _get_k8s_client(instance: Instance, db: AsyncSession) -> K8sClient:
     cluster_result = await db.execute(
-        select(Cluster).where(Cluster.id == instance.cluster_id)
+        select(Cluster).where(
+            Cluster.id == instance.cluster_id,
+            Cluster.deleted_at.is_(None),
+        )
     )
     cluster = cluster_result.scalar_one_or_none()
     if not cluster or not cluster.is_k8s or not cluster.credentials_encrypted:
@@ -311,8 +329,7 @@ class DockerFS:
         import os
         os.makedirs(str(self._base), exist_ok=True)
 
-    def _resolve(self, remote_path: str) -> "pathlib.Path":
-        import pathlib
+    def _resolve(self, remote_path: str) -> pathlib.Path:
         abs_slash = self._abs_prefix + "/"
         if remote_path.startswith(abs_slash):
             rel = remote_path[len(abs_slash):]
@@ -337,6 +354,13 @@ class DockerFS:
         p = self._resolve(remote_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+
+    async def read_binary(self, remote_path: str) -> bytes | None:
+        """Read a file as raw bytes. Returns None if file does not exist."""
+        p = self._resolve(remote_path)
+        if not p.exists():
+            return None
+        return p.read_bytes()
 
     async def write_binary(self, remote_path: str, data: bytes) -> None:
         p = self._resolve(remote_path)

@@ -27,9 +27,8 @@ async def run_seed(
     return {"ce_admin": ce_creds, "ee_admin": ee_creds}
 
 
-_DEFAULT_REGISTRY_CONFIGS: dict[str, str] = {
+DEFAULT_REGISTRY_CONFIGS: dict[str, str] = {
     "image_registry": "nodesk-center-cn-beijing.cr.volces.com/public/deskclaw-openclaw",
-    "image_registry_zeroclaw": "nodesk-center-cn-beijing.cr.volces.com/public/deskclaw-zeroclaw",
     "image_registry_nanobot": "nodesk-center-cn-beijing.cr.volces.com/public/deskclaw-nanobot",
 }
 
@@ -46,7 +45,7 @@ async def _seed_default_registry_configs(
 
     async with session_factory() as db:
         seeded = 0
-        for key, default_value in _DEFAULT_REGISTRY_CONFIGS.items():
+        for key, default_value in DEFAULT_REGISTRY_CONFIGS.items():
             row = (await db.execute(
                 select(SystemConfig).where(
                     SystemConfig.key == key,
@@ -195,8 +194,8 @@ async def _seed_default_org_and_templates(
                 pass
 
         from app.models.workspace_template import WorkspaceTemplate
-        preset_names = ["软件研发团队", "内容工作室", "研究实验室"]
-        preset_files = ["software_team.json", "content_studio.json", "research_lab.json"]
+        preset_names = ["软件研发团队", "内容工作室", "研究实验室", "自媒体内容工作室"]
+        preset_files = ["software_team.json", "content_studio.json", "research_lab.json", "content_media_studio.json"]
         for pname, pfile in zip(preset_names, preset_files):
             exists = await db.execute(
                 select(WorkspaceTemplate).where(
@@ -219,6 +218,8 @@ async def _seed_default_org_and_templates(
                     topology_snapshot=data.get("topology_snapshot", {}),
                     blackboard_snapshot=data.get("blackboard_snapshot", {}),
                     gene_assignments=data.get("gene_assignments", []),
+                    agent_specs=data.get("agent_specs", []),
+                    human_specs=data.get("human_specs", []),
                     created_by=None,
                 )
                 db.add(t)
@@ -341,32 +342,89 @@ async def _seed_ee_platform_admin(
                 await db.commit()
                 logger.info("\u79cd\u5b50\u6570\u636e\uff1a\u4e3a EE \u5e73\u53f0\u7ba1\u7406\u5458\u8865\u5efa AdminMembership")
 
-        stale = await db.execute(
-            select(AdminMembership).where(
-                AdminMembership.user_id != admin.id,
-                AdminMembership.deleted_at.is_(None),
-            )
-        )
-        stale_records = stale.scalars().all()
-        if stale_records:
-            stale_ids = [r.id for r in stale_records]
-            await db.execute(
-                update(AdminMembership)
-                .where(AdminMembership.id.in_(stale_ids))
-                .values(deleted_at=func.now())
-            )
-            await db.commit()
-            logger.info(
-                "种子数据：已清理 %d 条不属于 EE 平台管理员的 AdminMembership 残留记录",
-                len(stale_ids),
-            )
-
         if plain_password:
             return {"account": account, "password": plain_password}
         return None
 
 
+DEFAULT_REQUIRED_GENE_SLUGS: list[str] = [
+    "nodeskclaw-blackboard-tools",
+    "nodeskclaw-topology-awareness",
+    "nodeskclaw-performance-reader",
+    "nodeskclaw-proposals",
+    "nodeskclaw-gene-discovery",
+    "nodeskclaw-shared-files",
+    "akr-decomposer",
+]
+
+
+async def seed_default_required_genes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """为没有任何默认工作基因的组织补建 ai-employee-basics 基因组。
+
+    保护逻辑：仅当组织的 OrgRequiredGene 记录数为 0 时才填充。
+    管理员已手动配置过（即使只配了 1 个）的组织不受影响。
+    """
+    from app.models.gene import Gene
+    from app.models.org_required_gene import OrgRequiredGene
+    from app.models.organization import Organization
+
+    async with session_factory() as db:
+        gene_rows = (await db.execute(
+            select(Gene.id, Gene.slug).where(
+                Gene.slug.in_(DEFAULT_REQUIRED_GENE_SLUGS),
+                Gene.org_id.is_(None),
+                Gene.deleted_at.is_(None),
+            )
+        )).all()
+        slug_to_id = {row.slug: row.id for row in gene_rows}
+
+        missing_slugs = set(DEFAULT_REQUIRED_GENE_SLUGS) - slug_to_id.keys()
+        if missing_slugs:
+            logger.warning("默认工作基因 seed 跳过缺失的 slug: %s", missing_slugs)
+
+        if not slug_to_id:
+            logger.warning("默认工作基因 seed 跳过：genes 表中未找到任何目标基因")
+            return
+
+        orgs = (await db.execute(
+            select(Organization).where(Organization.deleted_at.is_(None))
+        )).scalars().all()
+
+        seeded_orgs = 0
+        for org in orgs:
+            count = (await db.execute(
+                select(func.count()).select_from(OrgRequiredGene).where(
+                    OrgRequiredGene.org_id == org.id,
+                    OrgRequiredGene.deleted_at.is_(None),
+                )
+            )).scalar_one()
+
+            if count > 0:
+                continue
+
+            for slug, gene_id in slug_to_id.items():
+                db.add(OrgRequiredGene(org_id=org.id, gene_id=gene_id))
+            seeded_orgs += 1
+
+        if seeded_orgs:
+            await db.commit()
+            logger.info(
+                "默认工作基因 seed 完成：为 %d 个组织添加了 %d 个默认基因",
+                seeded_orgs, len(slug_to_id),
+            )
+        else:
+            logger.info("默认工作基因检查完成，所有组织已有配置")
+
+
 async def _ensure_workspace_schedules(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    from app.services.workspace_defaults import (
+        DEFAULT_WORKSPACE_SCHEDULE_MESSAGE,
+        DEFAULT_WORKSPACE_SCHEDULE_NAME,
+        LEGACY_WORKSPACE_SCHEDULE_NAMES,
+    )
+
     async with session_factory() as db:
         from app.models.workspace import Workspace
         from app.models.workspace_schedule import WorkspaceSchedule
@@ -379,17 +437,124 @@ async def _ensure_workspace_schedules(session_factory: async_sessionmaker[AsyncS
             existing = (await db.execute(
                 select(WorkspaceSchedule).where(
                     WorkspaceSchedule.workspace_id == ws.id,
-                    WorkspaceSchedule.name.in_(["任务巡检", "定时巡检"]),
+                    WorkspaceSchedule.name.in_(LEGACY_WORKSPACE_SCHEDULE_NAMES),
                     WorkspaceSchedule.deleted_at.is_(None),
-                )
+                ).order_by(WorkspaceSchedule.created_at.desc())
             )).scalars().first()
             if existing is None:
                 db.add(WorkspaceSchedule(
                     workspace_id=ws.id,
-                    name="定时巡检",
+                    name=DEFAULT_WORKSPACE_SCHEDULE_NAME,
                     cron_expr="0 */4 * * *",
-                    message_template="请检查黑板待办任务队列，接取并执行优先级最高的任务。完成后汇报进展。",
+                    message_template=DEFAULT_WORKSPACE_SCHEDULE_MESSAGE,
                     is_active=False,
                 ))
         await db.commit()
         logger.info("种子数据：已为 %d 个工作区检查/补建定时巡检定时器", len(all_ws))
+
+
+async def seed_engine_versions(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Populate EngineVersion from existing Instance records on first run.
+
+    Only runs when the table is empty — does not overwrite admin choices.
+    """
+    from app.models.engine_version import EngineVersion
+    from app.models.instance import Instance
+
+    async with session_factory() as db:
+        count = (await db.execute(
+            select(func.count()).select_from(EngineVersion).where(
+                EngineVersion.deleted_at.is_(None),
+            )
+        )).scalar_one()
+        if count > 0:
+            return
+
+        rows = (await db.execute(
+            select(Instance.runtime, Instance.image_version)
+            .where(
+                Instance.image_version.isnot(None),
+                Instance.image_version != "",
+                Instance.deleted_at.is_(None),
+            )
+            .distinct()
+        )).all()
+
+        if not rows:
+            return
+
+        def _version_key(v: str) -> tuple[int, ...]:
+            try:
+                return tuple(int(x) for x in v.lstrip("v").split("."))
+            except ValueError:
+                return (0,)
+
+        by_runtime: dict[str, list[tuple[str, str]]] = {}
+        for runtime, image_version in rows:
+            rt = runtime or "openclaw"
+            by_runtime.setdefault(rt, []).append((image_version, image_version))
+
+        for rt, versions in by_runtime.items():
+            versions.sort(key=lambda x: _version_key(x[0]), reverse=True)
+            for idx, (image_tag, _) in enumerate(versions):
+                stripped = image_tag.lstrip("v") if image_tag.startswith("v") else image_tag
+                db.add(EngineVersion(
+                    runtime=rt,
+                    version=stripped,
+                    image_tag=image_tag,
+                    status="published",
+                    is_default=(idx == 0),
+                ))
+
+        await db.commit()
+        total = sum(len(v) for v in by_runtime.values())
+        logger.info("种子数据：从现有实例导入 %d 个引擎版本到版本目录", total)
+
+
+async def backfill_cluster_org_id(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """为 org_id 为空的活跃集群回填组织 ID（幂等）。
+
+    仅当系统中只有一个活跃组织时自动回填；多组织场景打 WARNING 跳过。
+    """
+    from app.models.cluster import Cluster
+    from app.models.organization import Organization
+
+    async with session_factory() as db:
+        orphan_result = await db.execute(
+            select(func.count()).select_from(Cluster).where(
+                Cluster.org_id.is_(None),
+                Cluster.deleted_at.is_(None),
+            )
+        )
+        orphan_count = orphan_result.scalar_one()
+        if orphan_count == 0:
+            return
+
+        org_result = await db.execute(
+            select(Organization).where(Organization.deleted_at.is_(None))
+        )
+        orgs = org_result.scalars().all()
+
+        if len(orgs) == 0:
+            logger.warning("集群 org_id 回填跳过：系统中无活跃组织")
+            return
+
+        if len(orgs) > 1:
+            logger.warning(
+                "集群 org_id 回填跳过：系统中有 %d 个活跃组织，需管理员手动分配 %d 个无组织集群",
+                len(orgs), orphan_count,
+            )
+            return
+
+        default_org = orgs[0]
+        await db.execute(
+            update(Cluster)
+            .where(Cluster.org_id.is_(None), Cluster.deleted_at.is_(None))
+            .values(org_id=default_org.id)
+        )
+        await db.commit()
+        logger.info("集群 org_id 回填完成：%d 个集群已关联到组织 %s", orphan_count, default_org.name)
